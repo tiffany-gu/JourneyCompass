@@ -58,6 +58,73 @@ interface RouteConciergeResponse {
   note?: string;
 }
 
+interface CategoryProfile {
+  match: (category: string) => boolean;
+  primaryTypes: string[];
+  fallbackTypes?: string[];
+  keywords: string[];
+  searchRadiusMeters?: number;
+  textQueries?: string[];
+}
+
+const CATEGORY_PROFILES: CategoryProfile[] = [
+  {
+    match: (category) => category.toLowerCase().includes('chinese'),
+    primaryTypes: ['chinese_restaurant'],
+    fallbackTypes: ['restaurant'],
+    keywords: [
+      'chinese',
+      'szechuan',
+      'sichuan',
+      'hunan',
+      'cantonese',
+      'dim sum',
+      'dumpling',
+      'noodle',
+      'bao',
+      'hot pot',
+      'xiao long bao',
+      'wok'
+    ],
+    searchRadiusMeters: 5000,
+    textQueries: [
+      'authentic chinese restaurant',
+      'sichuan restaurant',
+      'hand pulled noodle house',
+      'dumpling house'
+    ],
+  },
+  {
+    match: (category) => {
+      const lower = category.toLowerCase();
+      return lower.includes('boba') || lower.includes('bubble tea') || lower.includes('milk tea');
+    },
+    primaryTypes: ['bubble_tea_shop'],
+    fallbackTypes: ['cafe', 'tea_house'],
+    keywords: [
+      'boba',
+      'bubble tea',
+      'milk tea',
+      'tapioca',
+      'tea bar',
+      'fresh boba',
+      'taro latte',
+      'tea spot',
+      'tea shop'
+    ],
+    searchRadiusMeters: 4000,
+    textQueries: [
+      'bubble tea shop',
+      'boba tea',
+      'milk tea bar'
+    ],
+  },
+];
+
+function getCategoryProfile(category: string): CategoryProfile | undefined {
+  return CATEGORY_PROFILES.find(profile => profile.match(category));
+}
+
 /**
  * Calculate distance from a point to a polyline (route)
  */
@@ -260,37 +327,36 @@ async function searchPlacesByCategory(
   if (!apiKey) return [];
 
   const allPlaces: any[] = [];
+  const profile = getCategoryProfile(category);
 
   // Determine place type based on category
-  let placeType = 'restaurant';
-  let keyword = category.toLowerCase();
-
-  if (category.toLowerCase().includes('boba') || category.toLowerCase().includes('bubble tea')) {
-    placeType = 'cafe';
-    keyword = 'bubble tea boba';
-  } else if (category.toLowerCase().includes('chinese')) {
-    placeType = 'restaurant';
-    keyword = 'chinese restaurant';
-  }
+  const primaryTypes = profile?.primaryTypes?.length ? profile.primaryTypes : ['restaurant'];
+  const fallbackTypes = profile?.fallbackTypes ?? [];
+  const keyword = profile ? profile.keywords.join(' ') : category.toLowerCase();
+  const searchRadius = profile?.searchRadiusMeters ?? 5000;
 
   // Search at multiple points along the route
   for (const point of samplePoints) {
-    const url = new URL('https://maps.googleapis.com/maps/api/place/nearbysearch/json');
-    url.searchParams.append('location', `${point.lat},${point.lng}`);
-    url.searchParams.append('radius', '5000'); // 5km radius
-    url.searchParams.append('type', placeType);
-    url.searchParams.append('keyword', keyword);
-    url.searchParams.append('key', apiKey);
+    const typeCandidates = [...primaryTypes, ...fallbackTypes];
 
-    try {
-      const response = await fetch(url.toString());
-      const data = await response.json() as any;
+    for (const type of typeCandidates) {
+      const url = new URL('https://maps.googleapis.com/maps/api/place/nearbysearch/json');
+      url.searchParams.append('location', `${point.lat},${point.lng}`);
+      url.searchParams.append('radius', `${searchRadius}`);
+      url.searchParams.append('type', type);
+      url.searchParams.append('keyword', keyword);
+      url.searchParams.append('key', apiKey);
 
-      if (data.status === 'OK' && data.results) {
-        allPlaces.push(...data.results);
+      try {
+        const response = await fetch(url.toString());
+        const data = await response.json() as any;
+
+        if (data.status === 'OK' && data.results) {
+          allPlaces.push(...data.results);
+        }
+      } catch (error) {
+        console.error('[searchPlacesByCategory] Error:', error);
       }
-    } catch (error) {
-      console.error('[searchPlacesByCategory] Error:', error);
     }
   }
 
@@ -299,7 +365,24 @@ async function searchPlacesByCategory(
     new Map(allPlaces.map(p => [p.place_id, p])).values()
   );
 
-  return uniquePlaces;
+  // Quick name/type filter before returning
+  if (!profile) {
+    return uniquePlaces;
+  }
+
+  const filtered = uniquePlaces.filter(place => {
+    const lowerName = (place.name || '').toLowerCase();
+    const lowerTypes = (place.types || []).map((t: string) => t.toLowerCase());
+
+    const typeMatch = profile.primaryTypes.some(type => lowerTypes.includes(type)) ||
+      (profile.fallbackTypes || []).some(type => lowerTypes.includes(type));
+
+    const keywordMatch = profile.keywords.some(keyword => lowerName.includes(keyword));
+
+    return typeMatch || keywordMatch;
+  });
+
+  return filtered.length > 0 ? filtered : uniquePlaces;
 }
 
 /**
@@ -335,7 +418,7 @@ function generateGoogleMapsURL(
 function extractMenuInfo(details: any, category: string): {
   bestItems: string[];
   dietaryNotes: string[];
-  parkingNotes: string;
+  parkingNotes: string[];
 } {
   const bestItems: string[] = [];
   const dietaryNotes: string[] = [];
@@ -421,7 +504,7 @@ function extractMenuInfo(details: any, category: string): {
     }
   }
 
-  return { 
+  return {
     bestItems: bestItems.slice(0, 3), // Limit to top 3 items
     dietaryNotes: [...new Set(dietaryNotes)], // Remove duplicates
     parkingNotes: [...new Set(parkingNotes)], // Remove duplicates
@@ -488,6 +571,46 @@ function generateWhyThisStop(
 }
 
 /**
+ * Determine if a place truly matches the requested category
+ */
+function categoryMatchesPlace(
+  category: string,
+  profile: CategoryProfile | undefined,
+  place: any,
+  details: any
+): boolean {
+  if (!profile) {
+    return true;
+  }
+
+  const lowerName = (place.name || '').toLowerCase();
+  const lowerDetailsName = (details?.name || '').toLowerCase();
+  const lowerAddress = (details?.formatted_address || '').toLowerCase();
+  const types = new Set<string>([
+    ...((place.types || []).map((t: string) => t.toLowerCase())),
+    ...((details?.types || []).map((t: string) => t.toLowerCase())),
+  ]);
+
+  const typeMatch = profile.primaryTypes.some(type => types.has(type));
+  const fallbackTypeMatch = (profile.fallbackTypes || []).some(type => types.has(type));
+  const nameMatch = profile.keywords.some(keyword =>
+    lowerName.includes(keyword) ||
+    lowerDetailsName.includes(keyword)
+  );
+  const addressMatch = profile.keywords.some(keyword => lowerAddress.includes(keyword));
+
+  let reviewMatch = false;
+  if (details?.reviews && details.reviews.length > 0) {
+    const reviewsText = details.reviews
+      .map((r: any) => (r.text || '').toLowerCase())
+      .join(' ');
+    reviewMatch = profile.keywords.some(keyword => reviewsText.includes(keyword));
+  }
+
+  return typeMatch || fallbackTypeMatch || nameMatch || addressMatch || reviewMatch;
+}
+
+/**
  * Main route concierge function
  */
 export async function findRouteConciergeStops(
@@ -549,6 +672,7 @@ export async function findRouteConciergeStops(
   for (const category of categories) {
     console.log(`[route-concierge] Searching for ${category}...`);
 
+    const categoryProfile = getCategoryProfile(category);
     const candidates = await searchPlacesByCategory(category, decodedPolyline, samplePoints);
 
     // Filter and rank candidates
@@ -573,6 +697,11 @@ export async function findRouteConciergeStops(
       // Get place details
       const details = await getPlaceDetails(place.place_id);
       if (!details) continue;
+
+       // Ensure the place truly matches the requested category
+      if (!categoryMatchesPlace(category, categoryProfile, place, details)) {
+        continue;
+      }
 
       // Calculate distance off route
       const offRouteMiles = distanceToPolyline(
@@ -615,6 +744,9 @@ export async function findRouteConciergeStops(
       score += Math.log10(reviews + 1) * 10;
       score -= detourMinutes * 2;
       score -= offRouteMiles * 5;
+      if (categoryProfile) {
+        score += 15; // reward strong category alignment
+      }
       // Prefer stops at 25-75% progress
       if (progress >= 0.25 && progress <= 0.75) {
         score += 10;
@@ -656,12 +788,39 @@ export async function findRouteConciergeStops(
       let hoursSnippet = 'Hours vary';
 
       if (hours) {
-        openNow = hours.open_now || null;
+        openNow = hours.open_now !== undefined ? hours.open_now : null;
+
         if (hours.weekday_text && hours.weekday_text.length > 0) {
-          // Get today's hours
-          const today = new Date();
-          const dayIndex = today.getDay();
-          hoursSnippet = hours.weekday_text[dayIndex] || 'Hours vary';
+          let dayIndex: number;
+          if (timeContext?.timestamp) {
+            try {
+              const userDate = new Date(timeContext.timestamp);
+              dayIndex = isNaN(userDate.getTime()) ? new Date().getDay() : userDate.getDay();
+            } catch {
+              dayIndex = new Date().getDay();
+            }
+          } else {
+            dayIndex = new Date().getDay();
+          }
+
+          const googleDayIndex = dayIndex === 0 ? 6 : dayIndex - 1;
+          const rawHours =
+            hours.weekday_text[googleDayIndex] ||
+            hours.weekday_text[dayIndex] ||
+            hours.weekday_text[0];
+
+          if (rawHours) {
+            const splitIndex = rawHours.indexOf(':');
+            if (splitIndex > -1) {
+              const dayLabel = rawHours.substring(0, splitIndex).trim();
+              const hoursText = rawHours.substring(splitIndex + 1).trim();
+              hoursSnippet = `${dayLabel === '' ? 'Today' : dayLabel}: ${hoursText}`;
+            } else {
+              hoursSnippet = rawHours;
+            }
+          }
+        } else if (hours.periods && hours.periods.length > 0) {
+          hoursSnippet = 'See Google Maps for detailed hours';
         }
       }
 

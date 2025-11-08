@@ -80,6 +80,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
           console.log('[chat] Reverse geocoded origin from current location:', origin);
         }
         delete tripParameters.action;
+      } else if (!tripParameters.origin && userLocation) {
+        // User mentioned current location but Gemini may not have set action
+        const { lat, lng } = userLocation;
+        const origin = await reverseGeocode(lat, lng);
+        if (origin) {
+          tripParameters.origin = origin;
+          console.log('[chat] Filled missing origin from current location:', origin);
+        }
       }
 
       // Final validation: check if origin and destination are valid
