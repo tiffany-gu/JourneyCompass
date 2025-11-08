@@ -1,20 +1,29 @@
 import fetch from 'node-fetch';
+import OpenAI, { AzureOpenAI } from 'openai';
 
-// Using REST API directly instead of SDK to avoid auth issues
-// Get env variables at runtime instead of module load time
-const getGeminiApiKey = () => process.env.AI_INTEGRATIONS_GEMINI_API_KEY!;
-const DEFAULT_GEMINI_MODEL = 'gemini-1.5-flash-latest';
-const GEMINI_MODEL = process.env.AI_INTEGRATIONS_GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
-const GEMINI_FALLBACK_MODEL = process.env.AI_INTEGRATIONS_GEMINI_FALLBACK_MODEL || 'gemini-1.0-pro-latest';
-
-const buildGeminiUrl = (version: 'v1beta' | 'v1', model: string) =>
-  `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent`;
-
-// Use v1beta for Google Search grounding support (required for grounding features)
-const GEMINI_API_URL_V1BETA = buildGeminiUrl('v1beta', GEMINI_MODEL);
-// Use v1 for standard API calls (generateStopReason doesn't need grounding)
-const GEMINI_API_URL_V1 = buildGeminiUrl('v1', GEMINI_MODEL);
-const GEMINI_FALLBACK_API_URL_V1BETA = buildGeminiUrl('v1beta', GEMINI_FALLBACK_MODEL);
+// OpenAI client getter - supports both standard OpenAI and Azure OpenAI
+const getOpenAIClient = () => {
+  // Check if using Azure OpenAI
+  const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const azureApiKey = process.env.AZURE_OPENAI_API_KEY;
+  
+  if (azureEndpoint && azureApiKey) {
+    // Use Azure OpenAI
+    console.log('[OpenAI] Using Azure OpenAI endpoint');
+    return new AzureOpenAI({
+      apiKey: azureApiKey,
+      endpoint: azureEndpoint,
+      apiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-12-01-preview',
+      deployment: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5-chat', // deployment name
+    });
+  }
+  
+  // Fall back to standard OpenAI
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  console.log('[OpenAI] Using standard OpenAI API');
+  return new OpenAI({ apiKey });
+};
 const numberFormatter = new Intl.NumberFormat('en-US');
 const formatNumber = (value: number) => numberFormatter.format(value);
 
@@ -367,7 +376,7 @@ export async function parseUserRequest(userMessage: string, conversationHistory:
   // Clean up the message - remove common phrases that might interfere with parsing
   const cleanedMessage = userMessage.trim();
 
-  // Try AI extraction with Google Maps grounding for better location resolution
+  // Try AI extraction with OpenAI first
   const context = conversationHistory.length > 0
     ? `Previous conversation:\n${conversationHistory.join('\n')}\n\n`
     : '';
@@ -419,6 +428,14 @@ Output: {
   "destination": "Miami, FL",
   "action": "useCurrentLocation"
 }
+
+Input: "plan a trip to boston"
+Output: {
+  "destination": "Boston, MA",
+  "action": "useCurrentLocation"
+}
+
+IMPORTANT RULE: When no "from" location is specified, automatically set "action": "useCurrentLocation" so the system uses the user's current location as the starting point.
 
 Additional optional parameters to extract:
 - Fuel Level: "1/4 tank" → fuelLevel: 0.25, "half tank" → fuelLevel: 0.5, "full tank" → fuelLevel: 1.0
@@ -522,147 +539,48 @@ IMPORTANT:
 6. Extract quality indicators ("good", "best") as rating preferences
 7. Return ONLY valid JSON.`;
 
-  const apiKey = getGeminiApiKey();
-  console.log('Calling Gemini API with key:', apiKey ? `${apiKey.substring(0, 10)}...` : 'undefined');
-
-  try {
-    // Try v1beta with Google Search grounding first, fallback to v1 if not available
-    // Note: v1beta may not support all models, so we'll try v1beta first and fallback to v1
-    let requestBody = {
-      contents: [{
-        parts: [{
-          text: prompt
-        }]
-      }],
-      tools: [{
-        googleSearch: {}
-      }],
-      generationConfig: {
-        temperature: 0.2, // Lower temperature for more consistent extraction
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 1024,
-        responseMimeType: 'application/json', // Request JSON response
-      }
-    };
-
-    // Try v1beta first for Google Search grounding
-    let response = await fetch(`${GEMINI_API_URL_V1BETA}?key=${apiKey}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    // If v1beta fails with 404 (model not found), fallback to v1 without grounding
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.warn('[parseUserRequest] v1beta API not available, falling back to v1:', errorText);
+  const client = getOpenAIClient();
+  if (client) {
+    try {
+      const completionParams: any = {
+        messages: [
+          { role: 'system', content: 'You extract structured trip intents and locations. Return only valid JSON.' },
+          { role: 'user', content: prompt }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.2,
+      };
       
-      // Remove Google Search grounding and use v1 endpoint
-      requestBody = {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
-        }],
-        generationConfig: {
-          temperature: 0.2,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 1024,
-        }
-      } as any;
-
-      response = await fetch(`${GEMINI_API_URL_V1}?key=${apiKey}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody)
-      });
-    }
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[parseUserRequest] Gemini API HTTP error:', response.status, errorText);
-      // Fall through to regex fallback
-    } else {
-      const data: any = await response.json();
-
-      console.log('[parseUserRequest] Gemini API response:', JSON.stringify(data, null, 2));
-
-      // Check for API errors in response
-      if (data.error) {
-        console.error('[parseUserRequest] Gemini API returned error:', data.error);
-        // Fall through to regex fallback
-      } else if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
-        // Process the response
-        const text = data.candidates[0].content.parts[0].text;
-        console.log('[parseUserRequest] Extracted text from Gemini:', text);
-
-        // Extract JSON from the response (might be wrapped in markdown code blocks)
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]) as TripParameters;
-
-            console.log('[parseUserRequest] Initial parsed from Gemini (with Google Maps grounding):', JSON.stringify(parsed, null, 2));
-
-            // Gemini should now return well-formatted addresses, so minimal cleaning needed
-            if (parsed.origin) {
-              parsed.origin = parsed.origin.trim();
-              console.log('[parseUserRequest] Origin:', parsed.origin);
-            }
-
-            if (parsed.destination) {
-              parsed.destination = parsed.destination.trim();
-              console.log('[parseUserRequest] Destination:', parsed.destination);
-            }
-
-            // Simple validation - just check that we have actual location data
-            const invalidWords = /^(plan|route|trip|go|travel|want|need|from|to)$/i;
-
-            if (parsed.origin && (parsed.origin.length < 3 || invalidWords.test(parsed.origin))) {
-              console.warn('[parseUserRequest] Invalid origin after Gemini processing:', parsed.origin);
-              parsed.origin = undefined;
-            }
-
-            if (parsed.destination && (parsed.destination.length < 3 || invalidWords.test(parsed.destination))) {
-              console.warn('[parseUserRequest] Invalid destination after Gemini processing:', parsed.destination);
-              parsed.destination = undefined;
-            }
-
-            console.log('[parseUserRequest] Final validated trip parameters (Gemini with grounding):', JSON.stringify(parsed, null, 2));
-
-            // Return if we have valid data
-            const enriched = applyPreferenceHeuristics(parsed, cleanedMessage);
-            console.log('[parseUserRequest] Enriched trip parameters after heuristics:', JSON.stringify(enriched, null, 2));
-
-            if (enriched.origin && enriched.destination) {
-              return enriched;
-            } else if (enriched.destination && !enriched.origin) {
-              return {
-                ...enriched,
-                action: enriched.action || 'useCurrentLocation'
-              };
-            }
-            // Otherwise fall through to regex fallback
-            console.log('[parseUserRequest] Gemini parsing incomplete, falling back to regex');
-          } catch (parseError) {
-            console.error('[parseUserRequest] Failed to parse JSON from Gemini response:', parseError);
-            console.error('[parseUserRequest] Response text:', text);
-            // Fall through to regex fallback
-          }
-        }
-      } else {
-        console.warn('[parseUserRequest] No valid candidates in Gemini response, trying regex fallback');
+      // Only add model for standard OpenAI (Azure uses deployment from constructor)
+      if (!process.env.AZURE_OPENAI_ENDPOINT) {
+        completionParams.model = 'gpt-5-chat';
       }
+      
+      const r = await client.chat.completions.create(completionParams);
+      const text = r.choices?.[0]?.message?.content || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]) as TripParameters;
+        if (parsed.origin) parsed.origin = parsed.origin.trim();
+        if (parsed.destination) parsed.destination = parsed.destination.trim();
+        const invalidWords = /^(plan|route|trip|go|travel|want|need|from|to)$/i;
+        if (parsed.origin && (parsed.origin.length < 3 || invalidWords.test(parsed.origin))) {
+          parsed.origin = undefined;
+        }
+        if (parsed.destination && (parsed.destination.length < 3 || invalidWords.test(parsed.destination))) {
+          parsed.destination = undefined;
+        }
+        const enriched = applyPreferenceHeuristics(parsed, cleanedMessage);
+        if (enriched.origin && enriched.destination) return enriched;
+        if (enriched.destination && !enriched.origin) {
+          return { ...enriched, action: enriched.action || 'useCurrentLocation' };
+        }
+      }
+    } catch (e) {
+      console.warn('[parseUserRequest] OpenAI extraction failed:', e);
     }
-  } catch (apiError) {
-    console.error('[parseUserRequest] Error calling Gemini API:', apiError);
-    // Fall through to regex fallback
+  } else {
+    console.warn('[parseUserRequest] OPENAI_API_KEY not set; using regex fallback.');
   }
   
   // Fallback: Try simple regex patterns only if AI extraction failed
@@ -827,57 +745,51 @@ function buildFallbackStopReason(
     stopDetails.address ||
     '';
 
-  const locationText = location ? `near ${location}` : 'along your route';
+  const locationText = location ? `located at ${location}` : 'along your route';
   const stopTypeLabel = (() => {
     const normalized = (stopType || '').toLowerCase();
     if (normalized === 'gas') {
-      return 'fuel stop';
+      return 'refueling option';
     }
     if (normalized === 'restaurant' || normalized === 'food') {
       return 'dining option';
     }
     if (normalized === 'scenic') {
-      return 'scenic stop';
+      return 'scenic viewpoint';
     }
     return 'stop';
   })();
 
-  const sentences: string[] = [
-    `${stopName} is a convenient ${stopTypeLabel} ${locationText}.`,
-  ];
-
+  const sentences: string[] = [];
+  
+  // Build a concise, specific reason
+  let mainReason = `${stopName} is a well-positioned ${stopTypeLabel}`;
+  
+  // Add rating if available
   if (typeof stopDetails.rating === 'number') {
-    let ratingSentence = `It carries a ${stopDetails.rating.toFixed(1)}★ Google rating`;
+    mainReason += ` with a ${stopDetails.rating.toFixed(1)}★ rating`;
     if (
       typeof stopDetails.user_ratings_total === 'number' &&
       stopDetails.user_ratings_total > 0
     ) {
-      ratingSentence += ` backed by ${formatNumber(stopDetails.user_ratings_total)} reviews`;
+      mainReason += ` from ${formatNumber(stopDetails.user_ratings_total)} reviews`;
     }
-    sentences.push(`${ratingSentence}.`);
-  } else if (stopDetails.rating) {
-    sentences.push(`It is well-rated by visitors (${stopDetails.rating}).`);
   }
+  mainReason += '.';
+  sentences.push(mainReason);
 
+  // Add verified attributes if available (most important info)
   if (
     Array.isArray(stopDetails.verifiedAttributes) &&
     stopDetails.verifiedAttributes.length > 0
   ) {
     sentences.push(
-      `Verified highlights: ${stopDetails.verifiedAttributes.join(', ')}.`
+      `Verified features: ${stopDetails.verifiedAttributes.join(', ')}.`
     );
   }
 
-  if (
-    typeof stopDetails.price_level === 'number' &&
-    stopDetails.price_level > 0
-  ) {
-    sentences.push(`Typical price range: ${'$'.repeat(stopDetails.price_level)}.`);
-  }
-
-  if (routeContext) {
-    sentences.push(routeContext);
-  }
+  // Add location detail
+  sentences.push(`Conveniently ${locationText}.`);
 
   return sentences.filter(Boolean).join(' ');
 }
@@ -916,7 +828,7 @@ export async function generateStopReason(
       groundingInstructions = `Use Google Maps data to verify claims about this location.`;
   }
 
-  const prompt = `You are an expert travel advisor with DIRECT ACCESS to Google Maps data through grounding. Generate a trustworthy, specific justification (2-3 sentences) for why this stop was selected, using ONLY VERIFIED data from Google Maps.
+  const prompt = `You are an expert travel advisor. Generate a trustworthy, specific justification for why this stop was selected, using ONLY the provided data (ratings, reviews, attributes).
 
 LOCATION TO ANALYZE:
 - Name: ${stopName}
@@ -941,18 +853,23 @@ YOUR TASK:
 2. Analyze actual reviews, photos, and place details from Google Maps
 3. Write a justification based ONLY on facts you can verify through Google Maps grounding
 4. Include specific details like: exact rating from Maps, number of reviews, verified amenities, recent review mentions, distance from highway, parking details
+5. FORMAT AS BULLET POINTS (2-3 bullets max)
+6. Use plain text only - NO markdown formatting, NO asterisks, NO bold text
 
 STYLE: Direct, confident, data-driven. Highlight verified attributes prominently.
 
-Example for gas station with verified attributes:
-"Selected for its verified 4.7★ rating (1,247 reviews) with VERIFIED 24/7 operation and clean facilities confirmed in recent reviews. Located 0.3 miles off I-5 with easy re-entry, making it the highest-rated option at this 150-mile mark on your journey."
-
-Example for restaurant with verified attributes:
-"Chosen for its verified ${stopDetails.verifiedAttributes?.join(', ') || 'high ratings'} from Google Maps data. ${stopDetails.verifiedAttributes?.includes('vegetarian options') ? 'Recent reviews confirm excellent vegetarian options' : ''}${stopDetails.verifiedAttributes?.includes('kid-friendly') ? ' with kid-friendly amenities verified by multiple reviewers' : ''}. Rated ${rating}/5 with parking available, perfect for a meal break on your journey."
+Example format (plain text bullet points):
+• Selected for its verified 4.7 rating with 1,247 reviews
+• Open 24/7 with clean facilities confirmed in recent reviews
+• Located 0.3 miles off I-5 with easy re-entry
 
 ${typeSpecificContext}
 
-CRITICAL: Use Google Maps grounding to verify ALL claims. Do NOT hallucinate details. If data isn't available through grounding, acknowledge it (e.g., "well-rated option" instead of specific stars if grounding doesn't return rating).`;
+CRITICAL: 
+- Do NOT use asterisks or any markdown formatting
+- Format as bullet points (use • or -)
+- Do NOT invent facts beyond what's provided
+- Keep it concise (2-3 bullet points)`;
 
   const fallbackReason = buildFallbackStopReason(
     stopType,
@@ -962,112 +879,31 @@ CRITICAL: Use Google Maps grounding to verify ALL claims. Do NOT hallucinate det
   );
 
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      console.error('[generateStopReason] Gemini API key not found');
-      return fallbackReason;
-    }
-
-    const requestBody: any = {
-      contents: [{
-        parts: [{
-          text: prompt
-        }]
-      }],
-      generationConfig: {
-        temperature: 0.7, // Balanced temperature for factual yet engaging responses
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 400, // Allow for detailed responses
-      }
+    const client = getOpenAIClient();
+    if (!client) return fallbackReason;
+    
+    const completionParams: any = {
+      messages: [
+        { role: 'system', content: 'Write 2-3 concise, factual bullet points using only provided data. Use plain text with bullet symbols (•). NO markdown, NO asterisks, NO bold formatting.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.7,
+      max_tokens: 200,
     };
-
-    type Endpoint = { url: string; label: string };
-    const attemptedUrls = new Set<string>();
-    const endpoints: Endpoint[] = [];
-    const addEndpoint = (baseUrl: string | undefined, label: string) => {
-      if (!baseUrl) {
-        return;
-      }
-      const fullUrl = `${baseUrl}?key=${apiKey}`;
-      if (attemptedUrls.has(fullUrl)) {
-        return;
-      }
-      attemptedUrls.add(fullUrl);
-      endpoints.push({ url: fullUrl, label });
-    };
-
-    addEndpoint(GEMINI_API_URL_V1BETA, `v1beta (${GEMINI_MODEL})`);
-    addEndpoint(GEMINI_API_URL_V1, `v1 (${GEMINI_MODEL})`);
-    if (GEMINI_FALLBACK_API_URL_V1BETA !== GEMINI_API_URL_V1BETA) {
-      addEndpoint(
-        GEMINI_FALLBACK_API_URL_V1BETA,
-        `v1beta (${GEMINI_FALLBACK_MODEL})`
-      );
+    
+    // Only add model for standard OpenAI (Azure uses deployment from constructor)
+    if (!process.env.AZURE_OPENAI_ENDPOINT) {
+      completionParams.model = 'gpt-5-chat';
     }
-
-    for (const endpoint of endpoints) {
-      try {
-        console.log(`[generateStopReason] Calling Gemini ${endpoint.label}`);
-        const response = await fetch(endpoint.url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestBody),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(
-            `[generateStopReason] Gemini API HTTP error (${endpoint.label}): ${response.status}`,
-            errorText
-          );
-          continue;
-        }
-
-        const data: any = await response.json();
-        console.log(
-          `[generateStopReason] Gemini API response (${endpoint.label}):`,
-          JSON.stringify(data, null, 2)
-        );
-
-        if (data.error) {
-          console.error(
-            `[generateStopReason] Gemini API returned error (${endpoint.label}):`,
-            data.error
-          );
-          continue;
-        }
-
-        if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
-          const reason = data.candidates[0].content.parts[0].text.trim();
-          console.log(
-            `[generateStopReason] Generated sophisticated reason (${endpoint.label}): ${reason}`
-          );
-          return reason;
-        }
-
-        console.warn(
-          `[generateStopReason] No valid response from Gemini API (${endpoint.label})`
-        );
-      } catch (apiError: any) {
-        console.error(
-          `[generateStopReason] Error calling Gemini API (${endpoint.label}):`,
-          apiError
-        );
-      }
-    }
-
-    console.warn(
-      '[generateStopReason] Falling back to heuristic reason after Gemini attempts failed.'
-    );
-    return fallbackReason;
+    
+    const response = await client.chat.completions.create(completionParams);
+    const text = response.choices?.[0]?.message?.content?.trim();
+    
+    // Strip out all markdown formatting (asterisks for bold/italic)
+    const cleanText = text ? text.replace(/\*\*/g, '').replace(/\*/g, '') : fallbackReason;
+    return cleanText;
   } catch (error: any) {
-    console.error(
-      '[generateStopReason] Unexpected error preparing Gemini request:',
-      error
-    );
+    console.error('[generateStopReason] OpenAI error:', error);
     return fallbackReason;
   }
 }
@@ -1077,6 +913,9 @@ export async function generateConversationalResponse(
   tripParameters: TripParameters,
   hasMissingInfo: boolean
 ): Promise<string> {
+  // Check if we're using current location
+  const usingCurrentLocation = tripParameters.action === 'useCurrentLocation' || (!tripParameters.origin && tripParameters.destination);
+  
   let prompt = `You are a helpful journey planning assistant. The user said: "${userMessage}"
 
 Extracted parameters: ${JSON.stringify(tripParameters)}
@@ -1086,39 +925,44 @@ Extracted parameters: ${JSON.stringify(tripParameters)}
   if (hasMissingInfo) {
     prompt += `Some information is missing. Ask the user conversationally for the missing details (origin, destination, or fuel/vehicle info if they mentioned needing gas stops).`;
   } else {
-    prompt += `All necessary information is available. Acknowledge the request and let them know you're planning their route.`;
+    if (usingCurrentLocation) {
+      prompt += `All necessary information is available. The user did not specify a starting location, so we're using their current location as the starting point. Acknowledge the request conversationally and mention that you're using their current location as the starting point, then let them know you're planning their route.`;
+    } else {
+      prompt += `All necessary information is available. Acknowledge the request and let them know you're planning their route.`;
+    }
   }
 
-  const response = await fetch(`${GEMINI_API_URL_V1}?key=${getGeminiApiKey()}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: [{
-        parts: [{
-          text: prompt
-        }]
-      }],
-      generationConfig: {
-        temperature: 0.8,
-        maxOutputTokens: 512,
-      }
-    })
-  });
-
-  const data: any = await response.json();
-
-  if (!data.candidates || !data.candidates[0]?.content?.parts?.[0]?.text) {
+  try {
+    const client = getOpenAIClient();
+    if (!client) return "I'll help you plan your journey!";
+    
+    const completionParams: any = {
+      messages: [
+        { role: 'system', content: 'You are a concise, friendly journey planning assistant. Respond in plain text without any markdown formatting (no asterisks, no bold, no italics).' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.8,
+      max_tokens: 256,
+    };
+    
+    // Only add model for standard OpenAI (Azure uses deployment from constructor)
+    if (!process.env.AZURE_OPENAI_ENDPOINT) {
+      completionParams.model = 'gpt-5-chat';
+    }
+    
+    const response = await client.chat.completions.create(completionParams);
+    const content = response.choices?.[0]?.message?.content || "I'll help you plan your journey!";
+    
+    // Remove any markdown formatting (asterisks for bold/italic)
+    return content.replace(/\*\*/g, '').replace(/\*/g, '');
+  } catch {
     return "I'll help you plan your journey!";
   }
-
-  return data.candidates[0].content.parts[0].text;
 }
 
 /**
- * Generate a complete itinerary with stops using Gemini's structured output.
- * This function uses Gemini AI to suggest stops (gas, food, scenic) along a route
+ * Generate a complete itinerary with stops using OpenAI (gpt-5-chat).
+ * This function uses OpenAI to suggest stops (gas, food, scenic) along a route
  * based on user preferences and trip details.
  */
 export async function generateItineraryWithStops(
@@ -1134,7 +978,47 @@ export async function generateItineraryWithStops(
 - Always include the ORIGIN and DESTINATION as the first and last stops.
 - Generate plausible latitude and longitude coordinates for each stop.
 - Also, generate a simplified 'overviewPath' as an array of {lat, lng} points that roughly follows major roads, connecting all the stops in order.
-- If the user asks for a modification, generate a complete new itinerary based on the new constraints.`;
+- If the user asks for a modification, generate a complete new itinerary based on the new constraints.
+
+You must respond with ONLY valid JSON, no additional text or markdown formatting. The JSON must match this exact schema:
+{
+  "tripTitle": "string",
+  "routeComparison": [
+    {
+      "name": "string",
+      "duration": "string",
+      "distance": "string",
+      "cost": "string",
+      "summary": "string"
+    }
+  ],
+  "enrichedRoute": {
+    "summary": {
+      "name": "string",
+      "duration": "string",
+      "distance": "string",
+      "cost": "string",
+      "summary": "string"
+    },
+    "stops": [
+      {
+        "type": "ORIGIN" | "DESTINATION" | "GAS" | "FOOD" | "SCENIC" | "OTHER",
+        "name": "string",
+        "address": "string",
+        "reason": "string",
+        "durationMinutes": number,
+        "latitude": number,
+        "longitude": number
+      }
+    ],
+    "overviewPath": [
+      {
+        "lat": number,
+        "lng": number
+      }
+    ]
+  }
+}`;
 
   // Build context from trip parameters if available
   let contextPrompt = userPrompt;
@@ -1191,155 +1075,57 @@ export async function generateItineraryWithStops(
     }
   }
 
-  // Define the response schema for structured output
-  const responseSchema = {
-    type: 'object',
-    properties: {
-      tripTitle: {
-        type: 'string',
-        description: 'A creative and descriptive title for the trip, e.g., "Coastal Cruise: SF to LA".'
-      },
-      routeComparison: {
-        type: 'array',
-        description: 'A comparison of 2-3 route options, like scenic vs. fastest.',
-        items: {
-          type: 'object',
-          properties: {
-            name: { type: 'string', description: 'e.g., "Google\'s Fastest Route" or "Scenic Pacific Coast Highway"' },
-            duration: { type: 'string', description: 'Total travel time, e.g., "6h 30m"' },
-            distance: { type: 'string', description: 'Total distance, e.g., "450 miles"' },
-            cost: { type: 'string', description: 'Estimated cost for gas or tolls, e.g., "~$65 gas"' },
-            summary: { type: 'string', description: 'A brief summary of the route\'s characteristics.' }
-          },
-          required: ['name', 'duration', 'distance', 'cost', 'summary']
-        }
-      },
-      enrichedRoute: {
-        type: 'object',
-        description: 'The detailed, enriched itinerary for the user\'s chosen or recommended route.',
-        properties: {
-          summary: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', description: 'Name of the chosen route, e.g., "Your Scenic Route"' },
-              duration: { type: 'string' },
-              distance: { type: 'string' },
-              cost: { type: 'string' },
-              summary: { type: 'string' }
-            },
-            required: ['name', 'duration', 'distance', 'cost', 'summary']
-          },
-          stops: {
-            type: 'array',
-            description: 'An ordered list of stops along the route, starting with origin and ending with destination.',
-            items: {
-              type: 'object',
-              properties: {
-                type: {
-                  type: 'string',
-                  enum: ['ORIGIN', 'DESTINATION', 'GAS', 'FOOD', 'SCENIC', 'OTHER'],
-                  description: 'The type of stop.'
-                },
-                name: { type: 'string', description: 'Name of the place, e.g., "Shell Gas Station" or "Bixby Bridge Viewpoint".' },
-                address: { type: 'string', description: 'A plausible city or address for the stop.' },
-                reason: {
-                  type: 'string',
-                  description: 'The "why this stop?" explanation. Be specific, e.g., "Top-rated gas station just before a long stretch" or "Famous for its stunning coastal views and photo opportunities."'
-                },
-                durationMinutes: { type: 'integer', description: 'Estimated duration of the stop in minutes.' },
-                latitude: { type: 'number', description: 'The latitude coordinate of the stop.' },
-                longitude: { type: 'number', description: 'The longitude coordinate of the stop.' }
-              },
-              required: ['type', 'name', 'address', 'reason', 'durationMinutes', 'latitude', 'longitude']
-            }
-          },
-          overviewPath: {
-            type: 'array',
-            description: 'An array of {lat, lng} objects representing the route polyline for drawing on a map. Should contain at least two points.',
-            items: {
-              type: 'object',
-              properties: {
-                lat: { type: 'number' },
-                lng: { type: 'number' }
-              },
-              required: ['lat', 'lng']
-            }
-          }
-        },
-        required: ['summary', 'stops', 'overviewPath']
-      }
-    },
-    required: ['tripTitle', 'routeComparison', 'enrichedRoute']
-  };
-
-  const apiKey = getGeminiApiKey();
-  console.log('Calling Gemini API for itinerary generation with key:', apiKey ? `${apiKey.substring(0, 10)}...` : 'undefined');
-
-  const response = await fetch(`${GEMINI_API_URL_V1}?key=${apiKey}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: [{
-        parts: [{
-          text: contextPrompt
-        }]
-      }],
-      systemInstruction: {
-        parts: [{
-          text: systemInstruction
-        }]
-      },
-      generationConfig: {
-        temperature: 0.7,
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 8192,
-        responseMimeType: 'application/json',
-        responseSchema: responseSchema
-      }
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error('Gemini API error response:', response.status, errorText);
-    throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-  }
-
-  const data: any = await response.json();
-
-  console.log('Gemini API response for itinerary:', JSON.stringify(data, null, 2));
-
-  // Check for API errors in the response
-  if (data.error) {
-    console.error('Gemini API returned an error:', data.error);
-    throw new Error(`Gemini API error: ${data.error.message || JSON.stringify(data.error)}`);
-  }
-
-  if (!data.candidates || !data.candidates[0]?.content?.parts?.[0]?.text) {
-    console.error('No valid response from Gemini API for itinerary generation');
-    console.error('Full response:', JSON.stringify(data, null, 2));
-    throw new Error('Failed to generate itinerary from Gemini API: No valid candidates in response');
-  }
-
-  const jsonText = data.candidates[0].content.parts[0].text.trim();
-  let parsedJson: Itinerary;
-
   try {
-    parsedJson = JSON.parse(jsonText);
+    const client = getOpenAIClient();
+    if (client) {
+      const completionParams: any = {
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: contextPrompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 4000,
+        response_format: { type: 'json_object' }
+      };
+      
+      // Only add model for standard OpenAI (Azure uses deployment from constructor)
+      if (!process.env.AZURE_OPENAI_ENDPOINT) {
+        completionParams.model = 'gpt-5-chat';
+      }
+      
+      const response = await client.chat.completions.create(completionParams);
+
+      const content = response.choices?.[0]?.message?.content || '';
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      const parsedJson: Itinerary = JSON.parse(jsonMatch ? jsonMatch[0] : content);
+
+      if (parsedJson.enrichedRoute && parsedJson.enrichedRoute.stops && parsedJson.enrichedRoute.overviewPath) {
+        return parsedJson;
+      }
+      console.warn('[generateItineraryWithStops] Parsed JSON missing required fields, falling back.');
+    } else {
+      console.warn('[generateItineraryWithStops] OPENAI_API_KEY missing; returning fallback itinerary.');
+    }
   } catch (error) {
-    console.error('Failed to parse JSON from Gemini response:', error);
-    console.error('Response text:', jsonText);
-    throw new Error('Failed to parse itinerary JSON from Gemini response');
+    console.warn('[generateItineraryWithStops] OpenAI failed; returning fallback itinerary:', error);
   }
 
-  // Basic validation to ensure the parsed object looks like our itinerary
-  if (parsedJson.enrichedRoute && parsedJson.enrichedRoute.stops && parsedJson.enrichedRoute.overviewPath) {
-    return parsedJson;
-  } else {
-    console.error('Generated JSON does not match the expected Itinerary structure:', parsedJson);
-    throw new Error('Generated JSON does not match the expected Itinerary structure');
-  }
+  // Deterministic heuristic fallback: minimal route with origin and destination only
+  const origin = tripParameters?.origin || 'Origin';
+  const destination = tripParameters?.destination || 'Destination';
+  const title = `${origin} to ${destination}`;
+  return {
+    tripTitle: title,
+    routeComparison: [
+      { name: "Recommended", duration: "—", distance: "—", cost: "~$—", summary: "Direct route" }
+    ],
+    enrichedRoute: {
+      summary: { name: "Direct Route", duration: "—", distance: "—", cost: "~$—", summary: "Direct route between origin and destination." },
+      stops: [
+        { type: StopType.ORIGIN, name: origin, address: origin, reason: "Trip start", durationMinutes: 0, latitude: 0, longitude: 0 },
+        { type: StopType.DESTINATION, name: destination, address: destination, reason: "Trip end", durationMinutes: 0, latitude: 0, longitude: 0 },
+      ],
+      overviewPath: [{ lat: 0, lng: 0 }, { lat: 0, lng: 0 }],
+    }
+  };
 }

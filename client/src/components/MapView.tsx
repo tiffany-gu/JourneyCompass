@@ -146,8 +146,8 @@ export default function MapView({ route, stops = [], addedStops = [], isNavigati
     }
 
     // Decode and render polyline
-    if (route.overview_polyline?.points) {
-      const decodedPath = google.maps.geometry.encoding.decodePath(route.overview_polyline.points);
+    if (route.overview_polyline?.points && (google.maps as any)?.geometry?.encoding?.decodePath) {
+      const decodedPath = (google.maps as any).geometry.encoding.decodePath(route.overview_polyline.points);
 
       const routePolyline = new google.maps.Polyline({
         path: decodedPath,
@@ -594,9 +594,9 @@ export default function MapView({ route, stops = [], addedStops = [], isNavigati
       // Switch back to overview mode
       map.setTilt(0); // Flat map view
 
-      if (route) {
+      if (route && route.overview_polyline?.points && (google.maps as any)?.geometry?.encoding?.decodePath) {
         // If there's a route, fit to route bounds
-        const decodedPath = google.maps.geometry.encoding.decodePath(route.overview_polyline.points);
+        const decodedPath = (google.maps as any).geometry.encoding.decodePath(route.overview_polyline.points);
         const bounds = new google.maps.LatLngBounds();
         decodedPath.forEach((point) => {
           bounds.extend(point);

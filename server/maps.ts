@@ -415,7 +415,7 @@ export async function getPlaceDetails(placeId: string): Promise<PlaceDetailsResu
   try {
     const url = new URL('https://maps.googleapis.com/maps/api/place/details/json');
     url.searchParams.append('place_id', placeId);
-    url.searchParams.append('fields', 'place_id,name,formatted_address,rating,user_ratings_total,opening_hours,reviews,photos,types,serves_cuisine,price_level,website,formatted_phone_number');
+    url.searchParams.append('fields', 'place_id,name,geometry,formatted_address,vicinity,opening_hours,rating,price_level,user_ratings_total,website,photos,types');
     url.searchParams.append('key', apiKey);
 
     console.log('[getPlaceDetails] Fetching details for place:', placeId);
@@ -596,12 +596,7 @@ export async function verifyRestaurantAttributes(
       `${normalizedCuisine} restaurant`,
     ]);
 
-    const servesCuisine = Array.isArray(details.serves_cuisine)
-      ? details.serves_cuisine.map((c: string) => c.toLowerCase())
-      : [];
-
     const candidateStrings = [
-      ...servesCuisine,
       ...detailsTypes,
       ...placeTypes,
       (details.name || '').toLowerCase(),
@@ -756,15 +751,22 @@ export async function findPlacesAlongRoute(
 
   let filteredPlaces = allPlaces;
   
-  if (filters?.rating) {
-    filteredPlaces = filteredPlaces.filter(p => p.rating && p.rating >= filters.rating!);
+  if (type === 'restaurant') {
+    // Enforce stronger filters for restaurants
+    const minRating = Math.max(filters?.rating ?? 0, 4.3);
+    filteredPlaces = filteredPlaces.filter(p => (p.rating ?? 0) >= minRating && (p.user_ratings_total ?? 0) >= 50);
+  } else if (filters?.rating) {
+    filteredPlaces = filteredPlaces.filter(p => (p.rating ?? 0) >= filters.rating!);
   }
 
   const uniquePlaces = Array.from(
     new Map(filteredPlaces.map(p => [p.place_id, p])).values()
   );
 
-  return uniquePlaces.sort((a, b) => (b.rating || 0) - (a.rating || 0)).slice(0, 10);
+  // Cap results to reduce API spam downstream and keep UI snappy
+  return uniquePlaces
+    .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+    .slice(0, 10);
 }
 
 function decodePolyline(encoded: string): Array<{ lat: number; lng: number }> {

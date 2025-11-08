@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { parseUserRequest, generateConversationalResponse, generateStopReason, generateItineraryWithStops } from "./gemini";
+import { parseUserRequest, generateConversationalResponse, generateStopReason, generateItineraryWithStops } from "./gpt";
 import { getDirections, findPlacesAlongRoute, calculateGasStops, reverseGeocode, verifyGasStationQuality, verifyRestaurantAttributes, getPlaceDetails } from "./maps";
 import { findRouteConciergeStops } from "./concierge";
 import { insertTripRequestSchema, insertConversationMessageSchema } from "@shared/schema";
@@ -77,16 +77,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const origin = await reverseGeocode(lat, lng);
         if (origin) {
           tripParameters.origin = origin;
-          console.log('[chat] Reverse geocoded origin from current location:', origin);
+          console.log('[chat] Reverse geocoded origin from current location (explicit action):', origin);
         }
         delete tripParameters.action;
       } else if (!tripParameters.origin && userLocation) {
-        // User mentioned current location but Gemini may not have set action
+        // No origin provided - automatically use current location as starting point
         const { lat, lng } = userLocation;
         const origin = await reverseGeocode(lat, lng);
         if (origin) {
           tripParameters.origin = origin;
-          console.log('[chat] Filled missing origin from current location:', origin);
+          console.log('[chat] Auto-filled origin from current location (no starting position specified):', origin);
+        } else {
+          console.warn('[chat] Could not reverse geocode current location, using coordinates directly');
+          // Use coordinates directly if reverse geocoding fails
+          tripParameters.origin = `${lat},${lng}`;
         }
       }
 
@@ -915,7 +919,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
             console.log('[find-stops] Stops sorted by position along route:', sortedStops.map(s => s.name).join(' -> '));
           }
 
-          const waypoints = sortedStops.map(stop => ({
+          // Limit to at most 8 waypoints to avoid Directions API limits and keep routes stable
+          const waypoints = sortedStops.slice(0, 8).map(stop => ({
             name: stop.name,
             location: stop.location!,
           }));
@@ -1065,9 +1070,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
 
-      // Build waypoints string for Google Maps API
+      // Build waypoints string for Google Maps API (cap to 8)
       // Format: "location1|location2|location3"
-      const waypointsParam = waypoints.map(wp => {
+      const limitedWaypoints = waypoints.slice(0, 8);
+      const waypointsParam = limitedWaypoints.map(wp => {
         console.log('[recalculate-route] Waypoint:', wp.name, wp.location);
         return `${wp.location.lat},${wp.location.lng}`;
       }).join('|');
@@ -1103,7 +1109,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const url = new URL('https://maps.googleapis.com/maps/api/directions/json');
       url.searchParams.append('origin', origin);
       url.searchParams.append('destination', destination);
-      if (waypoints.length > 0) {
+      if (limitedWaypoints.length > 0) {
         url.searchParams.append('waypoints', `optimize:true|${waypointsParam}`);
       }
       url.searchParams.append('key', apiKey);
@@ -1156,11 +1162,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         route: newRoute,
       });
 
-      console.log(`[recalculate-route] Successfully updated trip request with ${waypoints.length} waypoint(s)`);
+      console.log(`[recalculate-route] Successfully updated trip request with ${limitedWaypoints.length} waypoint(s)`);
 
       return res.json({
         route: newRoute,
-        waypoints,
+        waypoints: limitedWaypoints,
       });
     } catch (error: any) {
       console.error('[recalculate-route] Unexpected error:', error);

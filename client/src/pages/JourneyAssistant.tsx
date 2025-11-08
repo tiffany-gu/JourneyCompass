@@ -37,7 +37,7 @@ export default function JourneyAssistant() {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
-      text: "Hi! I'm your Journey Assistant. Tell me where you're headed and I'll help you plan the perfect route with gas stops, restaurants, and scenic viewpoints along the way.",
+      text: "Hi! I'm your Journey Assistant. Tell me where you're headed and I'll help you plan the perfect route with gas stops, restaurants, and scenic viewpoints along the way. You can say something like 'to Boston' and I'll use your current location as the starting point!",
       isUser: false,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     },
@@ -90,16 +90,21 @@ export default function JourneyAssistant() {
       const fromPattern = /from\s+[a-zA-Z\s,]+\s+to\s+[a-zA-Z\s,]+/i;
       const myLocationPattern = /(my\s+(current\s+)?location|current\s+location|from\s+here|start\s+here|starting\s+from\s+here)/i;
 
-      // Use stored userLocation if available and user is asking for "to X" without "from"
-      let locationToSend = null;
+      // Determine if we should use current location as the starting point
+      // Use current location when:
+      // 1. User explicitly mentions "my location", "current location", etc.
+      // 2. User asks for route "to X" without specifying "from"
+      // 3. No "from" pattern is detected at all
       const shouldUseCurrentLocation =
         (toPattern.test(message) && !fromPattern.test(message)) ||
-        myLocationPattern.test(message);
+        myLocationPattern.test(message) ||
+        !fromPattern.test(message); // Always try to use current location if no "from" is specified
 
+      let locationToSend = null;
       if (shouldUseCurrentLocation) {
         if (userLocation) {
           locationToSend = userLocation;
-          console.log('[chatMutation] Using stored user location:', locationToSend);
+          console.log('[chatMutation] Using stored user location as starting point:', locationToSend);
         } else if ('geolocation' in navigator) {
           // Fallback: try to get location if not already stored
           try {
@@ -115,9 +120,17 @@ export default function JourneyAssistant() {
               lng: position.coords.longitude
             };
             setUserLocation(locationToSend); // Store for future use
-            console.log('[chatMutation] Got fresh user location:', locationToSend);
+            console.log('[chatMutation] Got fresh user location as starting point:', locationToSend);
           } catch (error) {
             console.error('[chatMutation] Could not get user location:', error);
+            // If we can't get location and user didn't specify "from", show a helpful message
+            if (!fromPattern.test(message)) {
+              toast({
+                title: "Location Access Needed",
+                description: "Please allow location access or specify a starting location (e.g., 'from Atlanta to...')",
+                variant: "destructive",
+              });
+            }
           }
         }
       }
@@ -371,6 +384,49 @@ export default function JourneyAssistant() {
     }
   };
 
+  const handleSkipStop = (stop: { type: string; name: string; location?: { lat: number; lng: number } }) => {
+    console.log('[handleSkipStop] Skipping stop:', stop);
+
+    // Check if this stop was already added to the route
+    const isInRoute = addedStops.some(s => s.name === stop.name);
+
+    if (isInRoute) {
+      // Remove from addedStops and recalculate route
+      const updatedAddedStops = addedStops.filter(s => s.name !== stop.name);
+      setAddedStops(updatedAddedStops);
+
+      toast({
+        title: "Stop Removed",
+        description: `${stop.name} has been removed from your route. Recalculating directions...`,
+      });
+
+      // Recalculate route without this stop
+      if (tripRequestId) {
+        if (updatedAddedStops.length > 0) {
+          // Still have stops, recalculate with remaining stops
+          recalculateRouteMutation.mutate({
+            tripRequestId,
+            waypoints: updatedAddedStops.map(s => ({
+              name: s.name,
+              location: s.location,
+            })),
+          });
+        } else {
+          // No more stops, re-plan the basic route
+          planRouteMutation.mutate(tripRequestId);
+        }
+      }
+    } else {
+      // Just remove from available stops list
+      setStops(prev => prev.filter(s => s.name !== stop.name));
+      
+      toast({
+        title: "Stop Skipped",
+        description: `${stop.name} has been removed from suggestions.`,
+      });
+    }
+  };
+
   const recalculateRouteMutation = useMutation({
     mutationFn: async ({ tripRequestId, waypoints }: { tripRequestId: string; waypoints: Array<{ name: string; location: { lat: number; lng: number } }> }) => {
       console.log('[recalculateRoute] Making request with:', { tripRequestId, waypoints });
@@ -468,6 +524,7 @@ export default function JourneyAssistant() {
                     distance={comparison.distance}
                     addedStops={addedStops}
                     onStartNavigation={handleStartNavigation}
+                    onRemoveStop={handleSkipStop}
                   />
                 </div>
               )}
@@ -479,7 +536,7 @@ export default function JourneyAssistant() {
                       key={index}
                       {...stop}
                       onAddToRoute={handleAddStopToRoute}
-                      onSkip={() => setStops(prev => prev.filter((_, i) => i !== index))}
+                      onSkip={() => handleSkipStop(stop)}
                     />
                   ))}
                 </div>
