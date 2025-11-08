@@ -3,10 +3,28 @@ import fetch from 'node-fetch';
 // Using REST API directly instead of SDK to avoid auth issues
 // Get env variables at runtime instead of module load time
 const getGeminiApiKey = () => process.env.AI_INTEGRATIONS_GEMINI_API_KEY!;
+const DEFAULT_GEMINI_MODEL = 'gemini-1.5-flash-latest';
+const GEMINI_MODEL = process.env.AI_INTEGRATIONS_GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+const GEMINI_FALLBACK_MODEL = process.env.AI_INTEGRATIONS_GEMINI_FALLBACK_MODEL || 'gemini-1.0-pro-latest';
+
+const buildGeminiUrl = (version: 'v1beta' | 'v1', model: string) =>
+  `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent`;
+
 // Use v1beta for Google Search grounding support (required for grounding features)
-const GEMINI_API_URL_V1BETA = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+const GEMINI_API_URL_V1BETA = buildGeminiUrl('v1beta', GEMINI_MODEL);
 // Use v1 for standard API calls (generateStopReason doesn't need grounding)
-const GEMINI_API_URL_V1 = 'https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent';
+const GEMINI_API_URL_V1 = buildGeminiUrl('v1', GEMINI_MODEL);
+const GEMINI_FALLBACK_API_URL_V1BETA = buildGeminiUrl('v1beta', GEMINI_FALLBACK_MODEL);
+const numberFormatter = new Intl.NumberFormat('en-US');
+const formatNumber = (value: number) => numberFormatter.format(value);
+
+interface CustomStopRequest {
+  id: string;
+  label?: string;
+  keywords: string[];
+  placeTypes: string[];
+  minRating?: number;
+}
 
 interface TripParameters {
   origin?: string;
@@ -25,12 +43,18 @@ interface TripParameters {
       openNow?: boolean;
       vegetarian?: boolean;
       vegan?: boolean;
+      keywords?: string[];
     };
     requestedStops?: {
       gas?: boolean;
       restaurant?: boolean;
       scenic?: boolean;
+      coffee?: boolean;
+      tea?: boolean;
+      dessert?: boolean;
+      bubbleTea?: boolean;
     };
+    customStops?: CustomStopRequest[];
   };
   action?: string;
 }
@@ -71,6 +95,270 @@ export interface Itinerary {
     stops: Stop[];
     overviewPath: { lat: number; lng: number }[];
   };
+}
+
+function applyPreferenceHeuristics(
+  tripParameters: TripParameters,
+  originalMessage: string
+): TripParameters {
+  if (!originalMessage) {
+    return tripParameters;
+  }
+
+  const message = originalMessage.toLowerCase();
+  const preferences = tripParameters.preferences
+    ? { ...tripParameters.preferences }
+    : {};
+  const requestedStops = preferences.requestedStops
+    ? { ...preferences.requestedStops }
+    : {};
+  const restaurantPreferences = preferences.restaurantPreferences
+    ? { ...preferences.restaurantPreferences }
+    : {};
+  const restaurantKeywords = new Set(
+    restaurantPreferences.keywords?.map(keyword => keyword.toLowerCase()) ?? []
+  );
+  const customStops: CustomStopRequest[] = preferences.customStops
+    ? preferences.customStops.map(stop => ({
+        ...stop,
+        keywords: [...stop.keywords],
+        placeTypes: [...stop.placeTypes],
+      }))
+    : [];
+
+  const addRestaurantKeyword = (keyword: string) => {
+    const normalized = keyword.trim().toLowerCase();
+    if (normalized && !restaurantKeywords.has(normalized)) {
+      restaurantKeywords.add(normalized);
+    }
+  };
+
+  const ensureCustomStop = (id: string, stop: CustomStopRequest) => {
+    const existingIndex = customStops.findIndex(existing => existing.id === id);
+    if (existingIndex === -1) {
+      customStops.push({
+        ...stop,
+        label: stop.label,
+        keywords: Array.from(new Set(stop.keywords.map(k => k.toLowerCase()))),
+        placeTypes: Array.from(new Set(stop.placeTypes)),
+        minRating: stop.minRating,
+      });
+    } else {
+      const existing = customStops[existingIndex];
+      const mergedKeywords = Array.from(
+        new Set([
+          ...existing.keywords.map(k => k.toLowerCase()),
+          ...stop.keywords.map(k => k.toLowerCase()),
+        ])
+      );
+      const mergedPlaceTypes = Array.from(
+        new Set([...existing.placeTypes, ...stop.placeTypes])
+      );
+      const mergedMinRating =
+        existing.minRating || stop.minRating
+          ? Math.max(existing.minRating ?? 0, stop.minRating ?? 0)
+          : undefined;
+
+      customStops[existingIndex] = {
+        ...existing,
+        ...stop,
+        label: existing.label || stop.label,
+        keywords: mergedKeywords,
+        placeTypes: mergedPlaceTypes,
+        minRating: mergedMinRating,
+      };
+    }
+  };
+
+  const cuisinePatterns: Array<{ regex: RegExp; cuisine: string; keyword?: string }> = [
+    { regex: /\bchinese\b/, cuisine: 'chinese', keyword: 'chinese restaurant' },
+    { regex: /\bitalian\b/, cuisine: 'italian', keyword: 'italian restaurant' },
+    { regex: /\bmexican\b/, cuisine: 'mexican', keyword: 'mexican restaurant' },
+    { regex: /\bthai\b/, cuisine: 'thai', keyword: 'thai restaurant' },
+    { regex: /\bjapanese\b/, cuisine: 'japanese', keyword: 'japanese restaurant' },
+    { regex: /\bsushi\b/, cuisine: 'japanese', keyword: 'sushi' },
+    { regex: /\bindian\b/, cuisine: 'indian', keyword: 'indian restaurant' },
+    { regex: /\bkorean\b/, cuisine: 'korean', keyword: 'korean restaurant' },
+    { regex: /\bmediterranean\b/, cuisine: 'mediterranean', keyword: 'mediterranean restaurant' },
+    { regex: /\bvietnamese\b/, cuisine: 'vietnamese', keyword: 'vietnamese restaurant' },
+    { regex: /\bseafood\b/, cuisine: 'seafood', keyword: 'seafood restaurant' },
+    { regex: /\bbbq\b/, cuisine: 'bbq', keyword: 'bbq restaurant' },
+    { regex: /\bsteak\b/, cuisine: 'steakhouse', keyword: 'steakhouse' },
+    { regex: /\bpizza\b/, cuisine: 'pizza', keyword: 'pizza' },
+    { regex: /\bburger\b/, cuisine: 'burger', keyword: 'burger' },
+    { regex: /\bboba\b/, cuisine: 'bubble tea', keyword: 'bubble tea' },
+  ];
+
+  const restaurantIntentRegex =
+    /\b(restaurant|food|lunch|dinner|eat|meal|breakfast|brunch|dining)\b/;
+  const gasIntentRegex =
+    /\b(gas station|gas stop|fuel stop|refuel|fill up|need gas|petrol)\b/;
+  const scenicIntentRegex =
+    /\b(scenic|viewpoint|view point|sightseeing|photo stop|lookout|vista|attraction)\b/;
+  const coffeeIntentRegex =
+    /\b(coffee|espresso|latte|cappuccino|coffee shop|café|cafe)\b/;
+  const dessertIntentRegex =
+    /\b(dessert|sweet treat|ice cream|gelato|pastry|bakery|cupcake|donut|doughnut)\b/;
+  const teaIntentRegex =
+    /\b(tea house|tea shop|tea stop|matcha)\b/;
+  const bubbleTeaRegex = /\b(bubble\s*tea|boba|milk tea)\b/;
+
+  if (restaurantIntentRegex.test(message)) {
+    requestedStops.restaurant = true;
+  }
+
+  cuisinePatterns.forEach(pattern => {
+    if (pattern.regex.test(message)) {
+      if (!restaurantPreferences.cuisine && pattern.cuisine !== 'bubble tea') {
+        restaurantPreferences.cuisine = pattern.cuisine;
+      }
+      if (pattern.keyword) {
+        addRestaurantKeyword(pattern.keyword);
+      }
+      requestedStops.restaurant = true;
+    }
+  });
+
+  if (/(vegetarian|plant-based|plant based|veggie)/.test(message)) {
+    restaurantPreferences.vegetarian = true;
+  }
+
+  if (/(vegan)/.test(message)) {
+    restaurantPreferences.vegan = true;
+    restaurantPreferences.vegetarian = true;
+  }
+
+  if (/(kid[-\s]?friendly|family[-\s]?friendly|kids menu)/.test(message)) {
+    restaurantPreferences.kidFriendly = true;
+  }
+
+  if (/(open now|currently open|still open)/.test(message)) {
+    restaurantPreferences.openNow = true;
+  }
+
+  if (/(cheap|budget|affordable|inexpensive)/.test(message)) {
+    restaurantPreferences.priceLevel = '$';
+  }
+
+  if (/(fine dining|upscale|fancy|expensive|luxury|high-end|high end)/.test(message)) {
+    restaurantPreferences.priceLevel = '$$$';
+  }
+
+  if (
+    /(top-rated|top rated|highly rated|best|4\.5 star|five star|5-star|5 star)/.test(
+      message
+    )
+  ) {
+    restaurantPreferences.rating = Math.max(
+      restaurantPreferences.rating ?? 0,
+      4.5
+    );
+  } else if (/(good|great|nice|solid food)/.test(message)) {
+    restaurantPreferences.rating = Math.max(
+      restaurantPreferences.rating ?? 0,
+      4.0
+    );
+  }
+
+  if (gasIntentRegex.test(message)) {
+    requestedStops.gas = true;
+  }
+
+  if (scenicIntentRegex.test(message)) {
+    requestedStops.scenic = true;
+    preferences.scenic = true;
+  }
+
+  if (/(avoid tolls|no tolls|without tolls)/.test(message)) {
+    preferences.avoidTolls = true;
+  }
+
+  if (/(fastest route|quickest route|make it fast)/.test(message)) {
+    preferences.fast = true;
+  }
+
+  if (coffeeIntentRegex.test(message)) {
+    requestedStops.coffee = true;
+    ensureCustomStop('coffee', {
+      id: 'coffee',
+      label: 'Coffee Shop',
+      keywords: ['coffee', 'espresso', 'latte'],
+      placeTypes: ['cafe', 'restaurant'],
+      minRating: 4.0,
+    });
+  }
+
+  if (dessertIntentRegex.test(message)) {
+    requestedStops.dessert = true;
+    ensureCustomStop('dessert', {
+      id: 'dessert',
+      label: 'Dessert Stop',
+      keywords: ['dessert', 'ice cream', 'gelato', 'bakery', 'pastry'],
+      placeTypes: ['bakery', 'cafe', 'restaurant'],
+      minRating: 4.0,
+    });
+  }
+
+  if (teaIntentRegex.test(message)) {
+    requestedStops.tea = true;
+    ensureCustomStop('tea', {
+      id: 'tea',
+      label: 'Tea House',
+      keywords: ['tea house', 'tea shop', 'matcha'],
+      placeTypes: ['cafe', 'restaurant'],
+      minRating: 4.0,
+    });
+  }
+
+  if (bubbleTeaRegex.test(message)) {
+    requestedStops.restaurant = true;
+    requestedStops.bubbleTea = true;
+    addRestaurantKeyword('bubble tea');
+    ensureCustomStop('bubbleTea', {
+      id: 'bubbleTea',
+      label: 'Bubble Tea Shop',
+      keywords: ['bubble tea', 'boba', 'milk tea'],
+      placeTypes: ['cafe', 'restaurant', 'meal_takeaway'],
+      minRating: Math.max(restaurantPreferences.rating ?? 0, 4.0),
+    });
+  }
+
+  if (Object.keys(restaurantPreferences).length > 0) {
+    requestedStops.restaurant = true;
+  }
+
+  const restaurantKeywordList = Array.from(restaurantKeywords);
+  if (restaurantKeywordList.length > 0) {
+    restaurantPreferences.keywords = restaurantKeywordList;
+  } else {
+    delete restaurantPreferences.keywords;
+  }
+
+  if (Object.keys(requestedStops).length > 0) {
+    preferences.requestedStops = requestedStops;
+  } else {
+    delete preferences.requestedStops;
+  }
+
+  if (Object.keys(restaurantPreferences).length > 0) {
+    preferences.restaurantPreferences = restaurantPreferences;
+  } else {
+    delete preferences.restaurantPreferences;
+  }
+
+  if (customStops.length > 0) {
+    preferences.customStops = customStops;
+  } else {
+    delete preferences.customStops;
+  }
+
+  if (Object.keys(preferences).length > 0) {
+    tripParameters.preferences = preferences;
+  } else {
+    delete tripParameters.preferences;
+  }
+
+  return tripParameters;
 }
 
 export async function parseUserRequest(userMessage: string, conversationHistory: string[]): Promise<TripParameters> {
@@ -284,7 +572,6 @@ IMPORTANT:
           topK: 40,
           topP: 0.95,
           maxOutputTokens: 1024,
-          responseMimeType: 'application/json',
         }
       } as any;
 
@@ -350,10 +637,16 @@ IMPORTANT:
             console.log('[parseUserRequest] Final validated trip parameters (Gemini with grounding):', JSON.stringify(parsed, null, 2));
 
             // Return if we have valid data
-            if (parsed.origin && parsed.destination) {
-              return parsed;
-            } else if (parsed.destination && !parsed.origin) {
-              return { destination: parsed.destination, action: 'useCurrentLocation' };
+            const enriched = applyPreferenceHeuristics(parsed, cleanedMessage);
+            console.log('[parseUserRequest] Enriched trip parameters after heuristics:', JSON.stringify(enriched, null, 2));
+
+            if (enriched.origin && enriched.destination) {
+              return enriched;
+            } else if (enriched.destination && !enriched.origin) {
+              return {
+                ...enriched,
+                action: enriched.action || 'useCurrentLocation'
+              };
             }
             // Otherwise fall through to regex fallback
             console.log('[parseUserRequest] Gemini parsing incomplete, falling back to regex');
@@ -389,7 +682,10 @@ IMPORTANT:
     // Validate: must be longer than 2 chars and not just "the", "a", "an"
     if (destination.length > 2 && destination.toLowerCase() !== 'the' && destination.toLowerCase() !== 'a' && destination.toLowerCase() !== 'an') {
       console.log('[parseUserRequest] Regex fallback extracted (to only):', { destination });
-      return { destination, action: 'useCurrentLocation' };
+      return applyPreferenceHeuristics(
+        { destination, action: 'useCurrentLocation' },
+        cleanedMessage
+      );
     }
   }
   
@@ -404,7 +700,10 @@ IMPORTANT:
     // Don't accept single words like "the", "a", "an" as destinations
     if (destination.length > 2 && !/^(the|a|an)$/i.test(destination)) {
       console.log('[parseUserRequest] Regex fallback extracted (to only pattern):', { destination });
-      return { destination, action: 'useCurrentLocation' };
+      return applyPreferenceHeuristics(
+        { destination, action: 'useCurrentLocation' },
+        cleanedMessage
+      );
     }
   }
 
@@ -463,7 +762,7 @@ IMPORTANT:
         destination = destination.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
 
         console.log('[parseUserRequest] Regex fallback extracted (from-to):', { origin, destination });
-        return { origin, destination };
+        return applyPreferenceHeuristics({ origin, destination }, cleanedMessage);
       }
     }
   }
@@ -487,7 +786,7 @@ IMPORTANT:
       origin = origin.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
       destination = destination.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
       console.log('[parseUserRequest] Regex fallback extracted (from-to regex):', { origin, destination });
-      return { origin, destination };
+      return applyPreferenceHeuristics({ origin, destination }, cleanedMessage);
     }
   }
 
@@ -507,13 +806,80 @@ IMPORTANT:
       
       if (origin.length > 2 && destination.length > 2) {
         console.log('Regex fallback extracted (simple to):', { origin, destination });
-        return { origin, destination };
+      return applyPreferenceHeuristics({ origin, destination }, cleanedMessage);
       }
     }
   }
 
   console.warn('Could not extract trip parameters from message:', cleanedMessage);
-  return {};
+  return applyPreferenceHeuristics({}, cleanedMessage);
+}
+
+function buildFallbackStopReason(
+  stopType: string,
+  stopName: string,
+  stopDetails: any,
+  routeContext: string
+): string {
+  const location =
+    stopDetails.vicinity ||
+    stopDetails.formatted_address ||
+    stopDetails.address ||
+    '';
+
+  const locationText = location ? `near ${location}` : 'along your route';
+  const stopTypeLabel = (() => {
+    const normalized = (stopType || '').toLowerCase();
+    if (normalized === 'gas') {
+      return 'fuel stop';
+    }
+    if (normalized === 'restaurant' || normalized === 'food') {
+      return 'dining option';
+    }
+    if (normalized === 'scenic') {
+      return 'scenic stop';
+    }
+    return 'stop';
+  })();
+
+  const sentences: string[] = [
+    `${stopName} is a convenient ${stopTypeLabel} ${locationText}.`,
+  ];
+
+  if (typeof stopDetails.rating === 'number') {
+    let ratingSentence = `It carries a ${stopDetails.rating.toFixed(1)}★ Google rating`;
+    if (
+      typeof stopDetails.user_ratings_total === 'number' &&
+      stopDetails.user_ratings_total > 0
+    ) {
+      ratingSentence += ` backed by ${formatNumber(stopDetails.user_ratings_total)} reviews`;
+    }
+    sentences.push(`${ratingSentence}.`);
+  } else if (stopDetails.rating) {
+    sentences.push(`It is well-rated by visitors (${stopDetails.rating}).`);
+  }
+
+  if (
+    Array.isArray(stopDetails.verifiedAttributes) &&
+    stopDetails.verifiedAttributes.length > 0
+  ) {
+    sentences.push(
+      `Verified highlights: ${stopDetails.verifiedAttributes.join(', ')}.`
+    );
+  }
+
+  if (
+    typeof stopDetails.price_level === 'number' &&
+    stopDetails.price_level > 0
+  ) {
+    sentences.push(`Typical price range: ${'$'.repeat(stopDetails.price_level)}.`);
+  }
+
+  if (routeContext) {
+    sentences.push(routeContext);
+  }
+
+  return sentences.filter(Boolean).join(' ');
 }
 
 export async function generateStopReason(
@@ -588,14 +954,20 @@ ${typeSpecificContext}
 
 CRITICAL: Use Google Maps grounding to verify ALL claims. Do NOT hallucinate details. If data isn't available through grounding, acknowledge it (e.g., "well-rated option" instead of specific stars if grounding doesn't return rating).`;
 
+  const fallbackReason = buildFallbackStopReason(
+    stopType,
+    stopName,
+    stopDetails,
+    routeContext
+  );
+
   try {
     const apiKey = getGeminiApiKey();
     if (!apiKey) {
       console.error('[generateStopReason] Gemini API key not found');
-      return `${stopName} is perfectly positioned ${location}, offering ${rating} quality service. It's an ideal spot to take a break during your journey.`;
+      return fallbackReason;
     }
 
-    // Use v1 API endpoint (doesn't need Google Search grounding - we already have verified data from Google Maps)
     const requestBody: any = {
       contents: [{
         parts: [{
@@ -610,43 +982,93 @@ CRITICAL: Use Google Maps grounding to verify ALL claims. Do NOT hallucinate det
       }
     };
 
-    const response = await fetch(`${GEMINI_API_URL_V1}?key=${apiKey}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody)
-    });
+    type Endpoint = { url: string; label: string };
+    const attemptedUrls = new Set<string>();
+    const endpoints: Endpoint[] = [];
+    const addEndpoint = (baseUrl: string | undefined, label: string) => {
+      if (!baseUrl) {
+        return;
+      }
+      const fullUrl = `${baseUrl}?key=${apiKey}`;
+      if (attemptedUrls.has(fullUrl)) {
+        return;
+      }
+      attemptedUrls.add(fullUrl);
+      endpoints.push({ url: fullUrl, label });
+    };
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[generateStopReason] Gemini API HTTP error: ${response.status}`, errorText);
-      return `${stopName} is perfectly positioned ${location}, offering ${rating} quality. It's an ideal spot to take a break and continue your journey refreshed.`;
+    addEndpoint(GEMINI_API_URL_V1BETA, `v1beta (${GEMINI_MODEL})`);
+    addEndpoint(GEMINI_API_URL_V1, `v1 (${GEMINI_MODEL})`);
+    if (GEMINI_FALLBACK_API_URL_V1BETA !== GEMINI_API_URL_V1BETA) {
+      addEndpoint(
+        GEMINI_FALLBACK_API_URL_V1BETA,
+        `v1beta (${GEMINI_FALLBACK_MODEL})`
+      );
     }
 
-    const data: any = await response.json();
+    for (const endpoint of endpoints) {
+      try {
+        console.log(`[generateStopReason] Calling Gemini ${endpoint.label}`);
+        const response = await fetch(endpoint.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+        });
 
-    console.log('[generateStopReason] Gemini API response:', JSON.stringify(data, null, 2));
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(
+            `[generateStopReason] Gemini API HTTP error (${endpoint.label}): ${response.status}`,
+            errorText
+          );
+          continue;
+        }
 
-    // Check for API errors
-    if (data.error) {
-      console.error('[generateStopReason] Gemini API returned error:', data.error);
-      return `${stopName} stands out ${location} with its ${rating} reputation. Perfect for a well-timed break that adds value to your trip.`;
+        const data: any = await response.json();
+        console.log(
+          `[generateStopReason] Gemini API response (${endpoint.label}):`,
+          JSON.stringify(data, null, 2)
+        );
+
+        if (data.error) {
+          console.error(
+            `[generateStopReason] Gemini API returned error (${endpoint.label}):`,
+            data.error
+          );
+          continue;
+        }
+
+        if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
+          const reason = data.candidates[0].content.parts[0].text.trim();
+          console.log(
+            `[generateStopReason] Generated sophisticated reason (${endpoint.label}): ${reason}`
+          );
+          return reason;
+        }
+
+        console.warn(
+          `[generateStopReason] No valid response from Gemini API (${endpoint.label})`
+        );
+      } catch (apiError: any) {
+        console.error(
+          `[generateStopReason] Error calling Gemini API (${endpoint.label}):`,
+          apiError
+        );
+      }
     }
 
-    // Extract the generated reason
-    if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
-      const reason = data.candidates[0].content.parts[0].text.trim();
-      console.log(`[generateStopReason] Generated sophisticated reason: ${reason}`);
-      return reason;
-    } else {
-      console.warn('[generateStopReason] No valid response from Gemini API');
-      console.warn('[generateStopReason] Response data:', JSON.stringify(data, null, 2));
-      return `${stopName} is perfectly positioned ${location}, offering ${rating} quality. It's an ideal spot to take a break during your journey.`;
-    }
+    console.warn(
+      '[generateStopReason] Falling back to heuristic reason after Gemini attempts failed.'
+    );
+    return fallbackReason;
   } catch (error: any) {
-    console.error('[generateStopReason] Error calling Gemini API:', error);
-    return `This ${stopType} is a good choice along your route based on location and ratings.`;
+    console.error(
+      '[generateStopReason] Unexpected error preparing Gemini request:',
+      error
+    );
+    return fallbackReason;
   }
 }
 
@@ -747,6 +1169,20 @@ export async function generateItineraryWithStops(
         if (restaurantPrefs.length > 0) {
           contextParts.push(`Restaurant preferences: ${restaurantPrefs.join(', ')}`);
         }
+        if (rp.keywords && rp.keywords.length > 0) {
+          contextParts.push(`Restaurant keywords: ${rp.keywords.join(', ')}`);
+        }
+      }
+      if (prefs.customStops && prefs.customStops.length > 0) {
+        const customSummary = prefs.customStops
+          .map(stop => {
+            const baseLabel = stop.label || stop.id;
+            const keywordSummary = stop.keywords && stop.keywords.length > 0
+              ? `keywords: ${stop.keywords.join(', ')}`
+              : undefined;
+            return keywordSummary ? `${baseLabel} (${keywordSummary})` : baseLabel;
+          });
+        contextParts.push(`Custom stops requested: ${customSummary.join('; ')}`);
       }
     }
     

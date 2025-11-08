@@ -21,12 +21,24 @@ export const tripRequests = pgTable("trip_requests", {
       openNow?: boolean;
       vegetarian?: boolean;
       vegan?: boolean;
+      keywords?: string[];
     };
     requestedStops?: {
       gas?: boolean;
       restaurant?: boolean;
       scenic?: boolean;
+      coffee?: boolean;
+      tea?: boolean;
+      dessert?: boolean;
+      bubbleTea?: boolean;
     };
+    customStops?: Array<{
+      id: string;
+      label?: string;
+      keywords: string[];
+      placeTypes: string[];
+      minRating?: number;
+    }>;
   }>(),
   route: jsonb("route").$type<any>(),
   stops: jsonb("stops").$type<any[]>(),

@@ -454,10 +454,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
               const requirements: {
                 vegetarian?: boolean;
                 kidFriendly?: boolean;
-                parking?: boolean;
                 cuisine?: string;
               } = {
-                parking: true, // Assume parking is needed for road trips
               };
 
               if (restaurantPrefs?.cuisine && !wantsVegetarian && !wantsVegan) {
@@ -476,35 +474,62 @@ export async function registerRoutes(app: Express): Promise<Server> {
               return {
                 restaurant,
                 verification,
+                skippedVerification: false,
               };
             })
           );
 
-          // Filter and sort by confidence score and requirements match
-          const validRestaurants = verifiedRestaurants
-            .filter((v): v is NonNullable<typeof v> => v !== null)
+          const evaluatedRestaurants = verifiedRestaurants
+            .filter((v): v is NonNullable<typeof v> => v !== null);
+
+          const hasSpecificRequirements = !!(
+            restaurantPrefs &&
+            (
+              restaurantPrefs.vegetarian ||
+              restaurantPrefs.vegan ||
+              restaurantPrefs.kidFriendly ||
+              restaurantPrefs.cuisine
+            )
+          );
+
+          let selectedRestaurants = evaluatedRestaurants
             .filter(v => {
-              // If user has specific requirements, only include restaurants that match
-              const hasRequirements = restaurantPrefs && (
-                restaurantPrefs.vegetarian ||
-                restaurantPrefs.vegan ||
-                restaurantPrefs.kidFriendly ||
-                restaurantPrefs.cuisine
-              );
-              
-              if (hasRequirements) {
+              if (hasSpecificRequirements) {
                 return v.verification.matchesRequirements;
               }
-              // Otherwise, include all restaurants with decent confidence
               return v.verification.confidenceScore >= 20;
             })
             .sort((a, b) => b.verification.confidenceScore - a.verification.confidenceScore)
             .slice(0, targetRestaurants);
 
-          console.log(`[find-stops] Selected ${validRestaurants.length} verified restaurants`);
+          if (selectedRestaurants.length === 0) {
+            console.log('[find-stops] No restaurants matched strict requirements; relaxing filters');
 
-          // Add verified restaurants to stops
-          for (const { restaurant, verification } of validRestaurants) {
+            const relaxedRestaurants = evaluatedRestaurants
+              .filter(v => v.verification.confidenceScore >= 10 || !hasSpecificRequirements)
+              .sort((a, b) => (b.restaurant.rating || 0) - (a.restaurant.rating || 0))
+              .slice(0, targetRestaurants);
+
+            if (relaxedRestaurants.length > 0) {
+              selectedRestaurants = relaxedRestaurants;
+            } else if (restaurants.length > 0) {
+              console.log('[find-stops] Falling back to top-rated search results without verification');
+              selectedRestaurants = restaurants.slice(0, targetRestaurants).map(restaurant => ({
+                restaurant,
+                verification: {
+                  matchesRequirements: false,
+                  verifiedAttributes: [],
+                  confidenceScore: restaurant.rating ? restaurant.rating * 2 : 0,
+                },
+                skippedVerification: true as boolean,
+              }));
+            }
+          }
+
+          console.log(`[find-stops] Selected ${selectedRestaurants.length} restaurants after applying fallbacks`);
+
+          // Add selected restaurants to stops
+          for (const { restaurant, verification } of selectedRestaurants) {
             console.log(`[find-stops] Selected restaurant: ${restaurant.name}`);
             console.log(`[find-stops] Verified attributes:`, verification.verifiedAttributes);
             console.log(`[find-stops] Confidence score:`, verification.confidenceScore);
@@ -559,6 +584,129 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       } else {
         console.log('[find-stops] Skipping restaurant search - route is short (<3 hours) and not requested');
+      }
+
+      const customStopRequestsRaw = tripRequest.preferences?.customStops;
+      const customStopRequests = Array.isArray(customStopRequestsRaw)
+        ? (customStopRequestsRaw as Array<{
+          id: string;
+          label?: string;
+          keywords?: string[];
+          placeTypes?: string[];
+          minRating?: number;
+        }>)
+        : [];
+
+      if (customStopRequests.length > 0) {
+        console.log('[find-stops] Processing custom stop requests:', customStopRequests.map(stop => stop.label || stop.id));
+
+        for (const customStop of customStopRequests) {
+          if (!customStop || !customStop.keywords || customStop.keywords.length === 0) {
+            console.warn('[find-stops] Skipping custom stop with insufficient data:', customStop);
+            continue;
+          }
+
+          const placeTypes = customStop.placeTypes && customStop.placeTypes.length > 0
+            ? customStop.placeTypes
+            : ['restaurant'];
+          const keywords = customStop.keywords;
+          const minimumRating =
+            customStop.minRating ??
+            tripRequest.preferences?.restaurantPreferences?.rating ??
+            4.0;
+
+          let selectedPlace: any | null = null;
+          let selectedKeyword: string | null = null;
+          let selectedType: string | null = null;
+
+          for (const placeType of placeTypes) {
+            for (const keyword of keywords) {
+              const searchResults = await findPlacesAlongRoute(
+                polyline,
+                placeType as any,
+                {
+                  rating: minimumRating,
+                  keyword,
+                }
+              );
+
+              const filteredResults = searchResults.filter(result =>
+                !stops.some(existingStop => existingStop.name === result.name)
+              );
+
+              if (filteredResults.length > 0) {
+                selectedPlace = filteredResults[0];
+                selectedKeyword = keyword;
+                selectedType = placeType;
+                break;
+              }
+            }
+
+            if (selectedPlace) {
+              break;
+            }
+          }
+
+          if (!selectedPlace) {
+            console.warn(`[find-stops] No places found for custom request "${customStop.label || customStop.id}"`);
+            continue;
+          }
+
+          let verification: { verifiedAttributes: string[]; confidenceScore: number } = {
+            verifiedAttributes: [],
+            confidenceScore: 0,
+          };
+
+          try {
+            verification = await verifyRestaurantAttributes(selectedPlace);
+          } catch (verificationError) {
+            console.warn('[find-stops] Verification failed for custom stop:', verificationError);
+          }
+
+          const contextSegments = [
+            `Custom stop "${customStop.label || customStop.id}" requested along your ${routeDistanceMiles.toFixed(0)}-mile journey from ${tripRequest.origin} to ${tripRequest.destination}`,
+          ];
+
+          if (selectedKeyword) {
+            contextSegments.push(`Keyword focus: ${selectedKeyword}`);
+          }
+
+          if (selectedType) {
+            contextSegments.push(`Place type targeted: ${selectedType}`);
+          }
+
+          if (verification.verifiedAttributes.length > 0) {
+            contextSegments.push(`Verified attributes: ${verification.verifiedAttributes.join(', ')}`);
+          }
+
+          const reason = await generateStopReason(
+            'restaurant',
+            selectedPlace.name,
+            {
+              ...selectedPlace,
+              verifiedAttributes: verification.verifiedAttributes,
+            },
+            contextSegments.join('. ')
+          );
+
+          const details = await getPlaceDetails(selectedPlace.place_id);
+          const hours = details?.opening_hours?.open_now !== undefined
+            ? (details.opening_hours.open_now ? 'Open now' : 'Closed')
+            : 'Hours vary';
+
+          stops.push({
+            type: 'restaurant',
+            name: selectedPlace.name,
+            category: customStop.label || selectedPlace.types?.[0]?.replace(/_/g, ' ') || 'Food & Drink',
+            rating: selectedPlace.rating,
+            priceLevel: selectedPlace.price_level ? '$'.repeat(selectedPlace.price_level) : undefined,
+            hours,
+            distanceOffRoute: '0.4 mi',
+            reason,
+            location: selectedPlace.geometry.location,
+            verifiedAttributes: verification.verifiedAttributes,
+          });
+        }
       }
 
       // Step 3: Find scenic stops if requested OR route is scenic/very long
