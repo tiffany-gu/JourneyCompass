@@ -37,7 +37,7 @@ export default function JourneyAssistant() {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
-      text: "Hi! I'm your Journey Assistant. Tell me where you're headed and I'll help you plan the perfect route with gas stops, restaurants, and scenic viewpoints along the way. You can say something like 'to Boston' and I'll use your current location as the starting point!",
+      text: "Hi! I'm Journey Compass. Tell me where you're headed and I'll help you plan the perfect route with gas stops, restaurants, and scenic viewpoints along the way. You can say something like 'to Boston' and I'll use your current location as the starting point!",
       isUser: false,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     },
