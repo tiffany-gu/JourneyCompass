@@ -52,6 +52,7 @@ An AI-powered conversational journey planning assistant that helps you plan road
 - **Google Maps API Key** (with Maps JavaScript API, Directions API, Places API, Geocoding API enabled)
 - **OpenAI API Key** or **Azure OpenAI** credentials
 - **Modern browser** with Web Speech API support (Chrome, Edge, Safari)
+- **Cross-platform support** - Works on Windows, macOS, and Linux
 
 ## Quick Start
 
@@ -310,9 +311,11 @@ Recalculate route with waypoints.
 
 ## Available Scripts
 
+All scripts are cross-platform compatible (Windows, macOS, Linux):
+
 ```bash
 # Development
-npm run dev          # Start development server with hot reload
+npm run dev          # Start development server with hot reload (kills port 3000 first)
 npm run dev:safe     # Start without killing port 3000
 
 # Production
@@ -330,6 +333,8 @@ npm run db:push      # Push schema changes to database
 # Type Checking
 npm run check        # Run TypeScript type checking
 ```
+
+**Note:** The project uses `cross-env` and `kill-port` packages to ensure all npm scripts work seamlessly across different operating systems.
 
 ## Voice Features Configuration
 
