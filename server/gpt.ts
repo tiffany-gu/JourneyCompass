@@ -62,10 +62,18 @@ interface TripParameters {
       tea?: boolean;
       dessert?: boolean;
       bubbleTea?: boolean;
+      grocery?: boolean;
     };
     customStops?: CustomStopRequest[];
+    timeConstraints?: {
+      arrivalTime?: string; // e.g., "5:00 PM"
+      arrivalTimeHours?: number; // e.g., 2 (arrive in 2 hours)
+      departureTime?: string; // e.g., "2:00 PM"
+    };
   };
   action?: string;
+  arrivalTime?: string;
+  arrivalTimeHours?: number;
 }
 
 // Types for Gemini-generated itinerary with stops
@@ -211,6 +219,57 @@ function applyPreferenceHeuristics(
   const teaIntentRegex =
     /\b(tea house|tea shop|tea stop|matcha)\b/;
   const bubbleTeaRegex = /\b(bubble\s*tea|boba|milk tea)\b/;
+  const groceryIntentRegex =
+    /\b(grocery|groceries|grocery store|supermarket|market|food store|shop for groceries|pick up groceries|get groceries)\b/;
+
+  // Initialize time constraints if not already set
+  if (!preferences.timeConstraints) {
+    preferences.timeConstraints = {};
+  }
+
+  // Extract time constraints: "arrive by 5pm", "get home by 5:00 PM", "get there by 3pm"
+  const arriveByPattern = /\b(arrive by|get.*by|be.*by|reach.*by|home by|there by|destination by)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|AM|PM)?/i;
+  const arriveByMatch = message.match(arriveByPattern);
+  if (arriveByMatch) {
+    const hour = parseInt(arriveByMatch[2]);
+    const minute = arriveByMatch[3] ? parseInt(arriveByMatch[3]) : 0;
+    const ampm = arriveByMatch[4]?.toUpperCase() || '';
+    
+    // Convert to 24-hour format
+    let hour24 = hour;
+    if (ampm === 'PM' && hour !== 12) {
+      hour24 = hour + 12;
+    } else if (ampm === 'AM' && hour === 12) {
+      hour24 = 0;
+    }
+    
+    preferences.timeConstraints.arrivalTime = `${hour24.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} ${ampm || (hour24 >= 12 ? 'PM' : 'AM')}`;
+  }
+
+  // Extract "arrive in X hours" pattern
+  const arriveInPattern = /\b(arrive in|get there in|reach in|be there in|home in)\s+(\d+(?:\.\d+)?)\s*(?:hour|hr|h)\b/i;
+  const arriveInMatch = message.match(arriveInPattern);
+  if (arriveInMatch) {
+    preferences.timeConstraints.arrivalTimeHours = parseFloat(arriveInMatch[2]);
+  }
+
+  // Extract departure time: "leave at 2pm", "depart at 2:00 PM"
+  const departAtPattern = /\b(leave at|depart at|start at|begin at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|AM|PM)?/i;
+  const departAtMatch = message.match(departAtPattern);
+  if (departAtMatch) {
+    const hour = parseInt(departAtMatch[2]);
+    const minute = departAtMatch[3] ? parseInt(departAtMatch[3]) : 0;
+    const ampm = departAtMatch[4]?.toUpperCase() || '';
+    
+    let hour24 = hour;
+    if (ampm === 'PM' && hour !== 12) {
+      hour24 = hour + 12;
+    } else if (ampm === 'AM' && hour === 12) {
+      hour24 = 0;
+    }
+    
+    preferences.timeConstraints.departureTime = `${hour24.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} ${ampm || (hour24 >= 12 ? 'PM' : 'AM')}`;
+  }
 
   if (restaurantIntentRegex.test(message)) {
     requestedStops.restaurant = true;
@@ -332,6 +391,18 @@ function applyPreferenceHeuristics(
     });
   }
 
+  // Detect grocery store requests
+  if (groceryIntentRegex.test(message)) {
+    requestedStops.grocery = true;
+    ensureCustomStop('grocery', {
+      id: 'grocery',
+      label: 'Grocery Store',
+      keywords: ['grocery', 'supermarket', 'grocery store', 'market', 'food store'],
+      placeTypes: ['supermarket', 'grocery_store', 'food', 'store'],
+      minRating: 3.5, // Lower threshold for grocery stores
+    });
+  }
+
   if (Object.keys(restaurantPreferences).length > 0) {
     requestedStops.restaurant = true;
   }
@@ -359,6 +430,18 @@ function applyPreferenceHeuristics(
     preferences.customStops = customStops;
   } else {
     delete preferences.customStops;
+  }
+
+  // Store time constraints in preferences and also at top level for backward compatibility
+  if (Object.keys(preferences.timeConstraints || {}).length > 0) {
+    if (preferences.timeConstraints?.arrivalTime) {
+      tripParameters.arrivalTime = preferences.timeConstraints.arrivalTime;
+    }
+    if (preferences.timeConstraints?.arrivalTimeHours) {
+      tripParameters.arrivalTimeHours = preferences.timeConstraints.arrivalTimeHours;
+    }
+  } else {
+    delete preferences.timeConstraints;
   }
 
   if (Object.keys(preferences).length > 0) {
@@ -449,8 +532,9 @@ Additional optional parameters to extract:
 - Stop Requests (CRITICAL - Extract what stops the user explicitly wants):
   - "I want a restaurant" / "restaurant along the way" / "need a place to eat" / "food" / "lunch" / "dinner" / "breakfast" / "hungry" / "eat" → preferences: {"requestedStops": {"restaurant": true}}
   - "gas station" / "need gas" / "fuel stop" / "refuel" / "fill up" / "gas" → preferences: {"requestedStops": {"gas": true}}
+  - "grocery" / "groceries" / "grocery store" / "supermarket" / "get groceries" / "stop by and get groceries" → preferences: {"requestedStops": {"grocery": true}}
   - "scenic view" / "scenic stop" / "scenic viewpoint" / "scenic route" / "viewpoints" / "sightseeing" / "attractions" → preferences: {"requestedStops": {"scenic": true}}
-  - If user mentions multiple stop types, include all of them: {"requestedStops": {"gas": true, "restaurant": true}}
+  - If user mentions multiple stop types, include all of them: {"requestedStops": {"gas": true, "restaurant": true, "grocery": true}}
   - Even vague mentions like "stops along the way" / "places to stop" / "take a break" / "rest stop" should trigger: {"requestedStops": {"restaurant": true}}
 
 - Custom Stop Types (CRITICAL - Extract specific types of places):
@@ -466,6 +550,8 @@ Additional optional parameters to extract:
   
   - "burger" / "burger place" / "hamburger" → customStops: [{"id": "burger", "label": "Burger Place", "keywords": ["burger", "hamburger", "cheeseburger"], "placeTypes": ["hamburger_restaurant", "american_restaurant", "fast_food_restaurant"], "minRating": 4.0}]
   
+  - "grocery" / "groceries" / "grocery store" / "supermarket" / "get groceries" / "stop by and get groceries" → customStops: [{"id": "grocery", "label": "Grocery Store", "keywords": ["grocery", "supermarket", "grocery store", "market", "food store"], "placeTypes": ["supermarket", "grocery_store", "food", "store"], "minRating": 3.5}]
+  
   IMPORTANT: If user mentions both generic type (e.g., "restaurant") and specific type (e.g., "sushi"), use the specific type in customStops instead of generic restaurant
 
 - Stop Placement Preferences (Extract location requirements for stops):
@@ -474,9 +560,12 @@ Additional optional parameters to extract:
   - Store these as maxDetourMinutes in customStops: "nearby" = 5 minutes, "along the way" = default
 
 - Timing Constraints (Extract arrival time preferences):
-  - "arrive in 2 hours" / "get there in 2 hours" / "reach in about 2 hours" → {"arrivalTimeHours": 2}
-  - "arrive by 3pm" / "get there by 5:00" → {"arrivalTime": "3:00 PM"} (extract specific time)
+  - "arrive in 2 hours" / "get there in 2 hours" / "reach in about 2 hours" → {"preferences": {"timeConstraints": {"arrivalTimeHours": 2}}}
+  - "arrive by 3pm" / "get there by 5:00" / "get home by 5pm" / "home by 5:00 PM" → {"preferences": {"timeConstraints": {"arrivalTime": "3:00 PM"}}} (extract specific time)
+  - "leave at 2pm" / "depart at 2:00 PM" → {"preferences": {"timeConstraints": {"departureTime": "2:00 PM"}}}
   - "quick trip" / "fast" / "fastest route" → {"preferences": {"fast": true}}
+  - When user says "get home by X" or "arrive by X", extract the time and set it as arrivalTime in timeConstraints
+  - Time format should be "HH:MM AM/PM" (e.g., "5:00 PM", "3:30 AM")
 
 - Restaurant Preferences (Extract specific requirements from user's description):
   - "mediterranean food" / "mediterranean restaurant" / "good mediterranean food" → preferences: {"restaurantPreferences": {"cuisine": "mediterranean"}}
@@ -559,8 +648,10 @@ Input: "Hey Journey, I want to go to miami, add a sushi place and gas station al
 Output: {
   "destination": "Miami, FL",
   "action": "useCurrentLocation",
-  "arrivalTimeHours": 2,
   "preferences": {
+    "timeConstraints": {
+      "arrivalTimeHours": 2
+    },
     "requestedStops": {
       "gas": true
     },
@@ -579,6 +670,29 @@ Output: {
         "keywords": ["sushi", "japanese", "sashimi", "roll", "nigiri"],
         "placeTypes": ["sushi_restaurant", "japanese_restaurant", "restaurant"],
         "minRating": 4.0
+      }
+    ]
+  }
+}
+
+Input: "I want to get home by 5pm and I want to stop by and get groceries"
+Output: {
+  "destination": "home",
+  "action": "useCurrentLocation",
+  "preferences": {
+    "timeConstraints": {
+      "arrivalTime": "5:00 PM"
+    },
+    "requestedStops": {
+      "grocery": true
+    },
+    "customStops": [
+      {
+        "id": "grocery",
+        "label": "Grocery Store",
+        "keywords": ["grocery", "supermarket", "grocery store", "market", "food store"],
+        "placeTypes": ["supermarket", "grocery_store", "food", "store"],
+        "minRating": 3.5
       }
     ]
   }

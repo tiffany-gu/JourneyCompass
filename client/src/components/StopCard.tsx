@@ -1,6 +1,6 @@
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Fuel, Utensils, Mountain, Star, Clock, MapPin } from "lucide-react";
+import { Fuel, Utensils, Mountain, Star, Clock, MapPin, ShoppingCart } from "lucide-react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -9,7 +9,7 @@ import {
 import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 
-type StopType = "gas" | "restaurant" | "scenic";
+type StopType = "gas" | "restaurant" | "scenic" | "grocery" | "coffee" | "tea" | "dessert" | "bubbleTea";
 
 interface StopCardProps {
   type: StopType;
@@ -21,6 +21,8 @@ interface StopCardProps {
   reason: string;
   location?: { lat: number; lng: number };
   verifiedAttributes?: string[]; // Grounded attributes verified from Google Maps
+  recommendedDuration?: string; // e.g., "30 min"
+  maxDuration?: string; // e.g., "60 min"
   onAddToRoute?: (stop: { type: StopType; name: string; location: { lat: number; lng: number } }) => void;
   onSkip?: () => void;
 }
@@ -29,12 +31,22 @@ const iconMap = {
   gas: Fuel,
   restaurant: Utensils,
   scenic: Mountain,
+  grocery: ShoppingCart,
+  coffee: Utensils, // Use Utensils as fallback for coffee
+  tea: Utensils, // Use Utensils as fallback for tea
+  dessert: Utensils, // Use Utensils as fallback for dessert
+  bubbleTea: Utensils, // Use Utensils as fallback for bubbleTea
 };
 
 const colorMap = {
   gas: "text-blue-600 dark:text-blue-400",
   restaurant: "text-orange-600 dark:text-orange-400",
   scenic: "text-purple-600 dark:text-purple-400",
+  grocery: "text-green-600 dark:text-green-400",
+  coffee: "text-amber-600 dark:text-amber-400",
+  tea: "text-emerald-600 dark:text-emerald-400",
+  dessert: "text-pink-600 dark:text-pink-400",
+  bubbleTea: "text-rose-600 dark:text-rose-400",
 };
 
 export default function StopCard({
@@ -47,6 +59,8 @@ export default function StopCard({
   reason,
   location,
   verifiedAttributes,
+  recommendedDuration,
+  maxDuration,
   onAddToRoute,
   onSkip,
 }: StopCardProps) {
@@ -77,6 +91,16 @@ export default function StopCard({
                 <div className="flex items-center gap-1">
                   <Clock className="w-3 h-3 text-muted-foreground" />
                   <span className="text-muted-foreground">{hours}</span>
+                </div>
+              )}
+              {/* Display time allocation if available */}
+              {recommendedDuration && (
+                <div className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                  <Clock className="w-3 h-3" />
+                  <span className="font-medium">Recommended: {recommendedDuration}</span>
+                  {maxDuration && (
+                    <span className="text-blue-600 dark:text-blue-400"> (max: {maxDuration})</span>
+                  )}
                 </div>
               )}
             </div>

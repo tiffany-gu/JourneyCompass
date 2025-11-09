@@ -5,6 +5,8 @@ import { parseUserRequest, generateConversationalResponse, generateStopReason, g
 import { getDirections, findPlacesAlongRoute, calculateGasStops, reverseGeocode, verifyGasStationQuality, verifyRestaurantAttributes, getPlaceDetails } from "./maps";
 import { findRouteConciergeStops } from "./concierge";
 import { insertTripRequestSchema, insertConversationMessageSchema } from "@shared/schema";
+import { calculateArrivalDeadline, calculateTimeAllocations, formatDuration } from "./timeUtils";
+import OpenAI, { AzureOpenAI } from "openai";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/chat", async (req: Request, res: Response) => {
@@ -704,8 +706,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ? (details.opening_hours.open_now ? 'Open now' : 'Closed')
             : 'Hours vary';
 
+          // Determine stop type based on custom stop ID or label
+          let stopType = 'restaurant';
+          if (customStop.id === 'grocery' || customStop.label?.toLowerCase().includes('grocery')) {
+            stopType = 'grocery';
+          } else if (customStop.id === 'coffee' || customStop.label?.toLowerCase().includes('coffee')) {
+            stopType = 'coffee';
+          } else if (customStop.id === 'dessert' || customStop.label?.toLowerCase().includes('dessert')) {
+            stopType = 'dessert';
+          } else if (customStop.id === 'tea' || customStop.label?.toLowerCase().includes('tea')) {
+            stopType = 'tea';
+          } else if (customStop.id === 'bubbleTea' || customStop.label?.toLowerCase().includes('bubble')) {
+            stopType = 'bubbleTea';
+          }
+
           stops.push({
-            type: 'restaurant',
+            type: stopType,
             name: selectedPlace.name,
             category: customStop.label || selectedPlace.types?.[0]?.replace(/_/g, ' ') || 'Food & Drink',
             rating: selectedPlace.rating,
@@ -805,6 +821,85 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         } catch (error) {
           console.error('[find-stops] Error finding fallback places:', error);
+        }
+      }
+
+      // Calculate time allocations if time constraints are present
+      let timeConstraintInfo: any = null;
+      const timeConstraints = tripRequest.preferences?.timeConstraints;
+      if (timeConstraints && (timeConstraints.arrivalTime || timeConstraints.arrivalTimeHours)) {
+        console.log('[find-stops] Time constraints detected, calculating time allocations');
+        
+        try {
+          const { deadline, departure } = calculateArrivalDeadline(timeConstraints);
+          
+          if (deadline && stops.length > 0) {
+            // Calculate route duration in minutes
+            const routeDurationMinutes = routeDuration / 60;
+            
+            // Prepare stop data for time calculation
+            // For now, we'll estimate travel times between stops (this could be improved with actual route calculations)
+            const stopsWithTravelTimes = stops.map((stop, index) => {
+              // Estimate: assume stops are evenly spaced along route
+              // Actual implementation would calculate real travel times
+              const segments = stops.length + 1; // segments between stops + to/from stops
+              const segmentTime = routeDurationMinutes / segments;
+              
+              return {
+                name: stop.name,
+                type: stop.type,
+                travelTimeFromPreviousMinutes: index === 0 ? segmentTime : segmentTime,
+                travelTimeToNextMinutes: index === stops.length - 1 ? segmentTime : segmentTime,
+              };
+            });
+            
+            // Calculate time allocations
+            const timeCalculation = calculateTimeAllocations(
+              deadline,
+              departure,
+              routeDurationMinutes,
+              stopsWithTravelTimes,
+              10 // 10 minute buffer
+            );
+            
+            console.log('[find-stops] Time calculation result:', {
+              totalTravelTime: formatDuration(timeCalculation.totalTravelTimeMinutes),
+              availableForStops: formatDuration(timeCalculation.availableTimeForStopsMinutes),
+              isFeasible: timeCalculation.isFeasible,
+              warning: timeCalculation.warning,
+            });
+            
+            // Add time allocation info to each stop
+            stops.forEach((stop) => {
+              const recommendedMinutes = timeCalculation.recommendedStopDurations.get(stop.name);
+              const maxMinutes = timeCalculation.maxStopDurations.get(stop.name);
+              
+              if (recommendedMinutes !== undefined) {
+                stop.recommendedDurationMinutes = recommendedMinutes;
+                stop.recommendedDuration = formatDuration(recommendedMinutes);
+              }
+              if (maxMinutes !== undefined) {
+                stop.maxDurationMinutes = maxMinutes;
+                stop.maxDuration = formatDuration(maxMinutes);
+              }
+            });
+            
+            // Store time constraint info to return in response
+            timeConstraintInfo = {
+              arrivalDeadline: deadline.toISOString(),
+              departureTime: departure?.toISOString(),
+              totalTravelTimeMinutes: timeCalculation.totalTravelTimeMinutes,
+              availableTimeForStopsMinutes: timeCalculation.availableTimeForStopsMinutes,
+              isFeasible: timeCalculation.isFeasible,
+              warning: timeCalculation.warning,
+            };
+            
+            if (timeCalculation.warning) {
+              console.warn('[find-stops] Time constraint warning:', timeCalculation.warning);
+            }
+          }
+        } catch (error) {
+          console.error('[find-stops] Error calculating time allocations:', error);
         }
       }
 
@@ -937,7 +1032,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             const apiKey = process.env.GOOGLE_MAPS_API_KEY;
             if (!apiKey) {
               console.error('[find-stops] Google Maps API key not found');
-              return res.json({ stops, route: tripRequest.route }); // Return stops without recalculating route
+              return res.json({ stops, route: tripRequest.route, timeConstraintInfo }); // Return stops without recalculating route
             }
 
             // Use coordinates from the original route if available, otherwise use addresses
@@ -984,7 +1079,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             if (!directionsResponse.ok) {
               console.error('[find-stops] Directions API HTTP error:', directionsResponse.status);
               // Continue without recalculating route
-              return res.json({ stops, route: tripRequest.route });
+              return res.json({ stops, route: tripRequest.route, timeConstraintInfo });
             }
 
             const directionsData = await directionsResponse.json();
@@ -1005,23 +1100,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
               return res.json({ 
                 stops,
                 route: updatedRoute, // Return the updated route with waypoints
+                timeConstraintInfo,
               });
             } else {
               console.warn('[find-stops] Directions API returned non-OK status:', directionsData.status, directionsData.error_message);
               console.warn('[find-stops] Continuing with original route');
               // Continue with original route if waypoints fail
-              return res.json({ stops, route: tripRequest.route });
+              return res.json({ stops, route: tripRequest.route, timeConstraintInfo });
             }
           }
         } catch (routeError) {
           console.error('[find-stops] Error recalculating route with waypoints:', routeError);
           // Continue without recalculating route if there's an error
-          return res.json({ stops, route: tripRequest.route });
+          return res.json({ stops, route: tripRequest.route, timeConstraintInfo });
         }
       }
 
       console.log(`[find-stops] Returning ${stops.length} stops for trip ${tripRequestId}`);
-      res.json({ stops, route: tripRequest.route });
+      res.json({ stops, route: tripRequest.route, timeConstraintInfo });
     } catch (error: any) {
       console.error('Find stops error:', error);
       res.status(500).json({ error: error.message });
@@ -1344,6 +1440,222 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     return summary;
   }
+
+  // Voice transcription endpoint using Azure OpenAI Whisper
+  app.post("/api/transcribe", async (req: Request, res: Response) => {
+    try {
+      console.log('[transcribe] ===== TRANSCRIPTION REQUEST RECEIVED =====');
+      console.log('[transcribe] Request headers:', JSON.stringify(req.headers, null, 2));
+      console.log('[transcribe] Request body keys:', Object.keys(req.body || {}));
+      console.log('[transcribe] Has audio data:', !!req.body?.audio);
+      console.log('[transcribe] Audio data type:', typeof req.body?.audio);
+      if (req.body?.audio) {
+        console.log('[transcribe] Audio data length (chars):', req.body.audio.length);
+        console.log('[transcribe] Audio data prefix (first 100):', req.body.audio.substring(0, 100));
+      }
+      console.log('[transcribe] MIME type from request:', req.body?.mimeType);
+
+      // Check if request has audio data
+      if (!req.body || !req.body.audio) {
+        console.error('[transcribe] No audio data in request body');
+        return res.status(400).json({ error: 'No audio data provided' });
+      }
+
+      // Get Azure OpenAI configuration
+      const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+      const azureApiKey = process.env.AZURE_OPENAI_API_KEY;
+      // Whisper API may use a different API version than the chat API
+      const whisperApiVersion = process.env.AZURE_OPENAI_WHISPER_API_VERSION || process.env.AZURE_OPENAI_API_VERSION || '2024-06-01';
+      const whisperDeployment = process.env.AZURE_OPENAI_WHISPER_DEPLOYMENT || process.env.AZURE_OPENAI_DEPLOYMENT || 'whisper';
+
+      // Validate configuration
+      if (!azureEndpoint || !azureApiKey) {
+        console.error('[transcribe] Azure OpenAI not configured');
+        return res.status(500).json({ 
+          error: 'Azure OpenAI not configured. Please set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY' 
+        });
+      }
+
+      if (!whisperDeployment) {
+        console.error('[transcribe] Whisper deployment not configured');
+        return res.status(500).json({ 
+          error: 'Whisper deployment not configured. Please set AZURE_OPENAI_WHISPER_DEPLOYMENT' 
+        });
+      }
+
+      // Normalize endpoint URL (ensure it doesn't end with /)
+      const normalizedEndpoint = azureEndpoint.endsWith('/') 
+        ? azureEndpoint.slice(0, -1) 
+        : azureEndpoint;
+
+      // Construct the Azure OpenAI Whisper endpoint URL
+      // Format: {endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version={version}
+      const whisperUrl = `${normalizedEndpoint}/openai/deployments/${whisperDeployment}/audio/transcriptions?api-version=${whisperApiVersion}`;
+
+      console.log('[transcribe] Using Whisper configuration:', {
+        endpoint: normalizedEndpoint,
+        deployment: whisperDeployment,
+        apiVersion: whisperApiVersion,
+        url: whisperUrl
+      });
+
+      // Extract audio data (expecting base64 encoded audio)
+      console.log('[transcribe] ===== EXTRACTING AUDIO DATA =====');
+      const audioData = req.body.audio;
+      console.log('[transcribe] audioData type:', typeof audioData);
+      console.log('[transcribe] audioData length:', audioData?.length);
+
+      let audioBuffer: Buffer;
+
+      if (typeof audioData === 'string') {
+        console.log('[transcribe] Audio data is string, converting from base64...');
+        console.log('[transcribe] Has comma separator:', audioData.includes(','));
+
+        // Remove data URL prefix if present (e.g., "data:audio/webm;base64,")
+        const base64Data = audioData.includes(',') ? audioData.split(',')[1] : audioData;
+        console.log('[transcribe] Base64 data length after prefix removal:', base64Data.length);
+        console.log('[transcribe] Base64 first 50 chars:', base64Data.substring(0, 50));
+
+        audioBuffer = Buffer.from(base64Data, 'base64');
+        console.log('[transcribe] Buffer created from base64');
+      } else if (Buffer.isBuffer(audioData)) {
+        console.log('[transcribe] Audio data is already a Buffer');
+        audioBuffer = audioData;
+      } else {
+        console.error('[transcribe] Invalid audio format, type:', typeof audioData);
+        return res.status(400).json({ error: 'Invalid audio format. Expected base64 string or buffer' });
+      }
+
+      console.log('[transcribe] Audio buffer created, length:', audioBuffer.length, 'bytes');
+
+      if (audioBuffer.length === 0) {
+        console.error('[transcribe] Audio buffer is empty (0 bytes)');
+        return res.status(400).json({ error: 'Audio buffer is empty' });
+      }
+
+      console.log('[transcribe] Audio buffer first 20 bytes:', audioBuffer.slice(0, 20));
+
+      // Determine file extension and MIME type
+      const mimeType = req.body.mimeType || 'audio/webm';
+      let fileExtension = 'webm';
+      if (mimeType.includes('wav')) fileExtension = 'wav';
+      else if (mimeType.includes('mp3')) fileExtension = 'mp3';
+      else if (mimeType.includes('m4a')) fileExtension = 'm4a';
+      else if (mimeType.includes('ogg')) fileExtension = 'ogg';
+      else if (mimeType.includes('mp4')) fileExtension = 'mp4';
+
+      // Create FormData for multipart/form-data request
+      // Node.js 18+ has native FormData support
+      console.log('[transcribe] ===== CREATING FORMDATA =====');
+      const filename = `audio.${fileExtension}`;
+      console.log('[transcribe] Filename:', filename);
+      console.log('[transcribe] File extension:', fileExtension);
+      console.log('[transcribe] MIME type:', mimeType);
+
+      // Convert Buffer to Uint8Array for Blob compatibility
+      console.log('[transcribe] Converting Buffer to Uint8Array...');
+      const uint8Array = new Uint8Array(audioBuffer);
+      console.log('[transcribe] Uint8Array created, length:', uint8Array.length);
+      console.log('[transcribe] Uint8Array first 20 bytes:', Array.from(uint8Array.slice(0, 20)));
+
+      // Create a Blob from the buffer for FormData
+      console.log('[transcribe] Creating Blob for FormData...');
+      const audioBlob = new Blob([uint8Array], { type: mimeType });
+      console.log('[transcribe] Blob created, size:', audioBlob.size, 'bytes');
+      console.log('[transcribe] Blob type:', audioBlob.type);
+
+      // Create FormData
+      console.log('[transcribe] Creating FormData...');
+      const formData = new FormData();
+      formData.append('file', audioBlob, filename);
+      formData.append('language', 'en');
+      formData.append('response_format', 'text');
+      console.log('[transcribe] FormData created with fields: file, language, response_format');
+
+      console.log('[transcribe] ===== CALLING AZURE OPENAI WHISPER API =====');
+      console.log('[transcribe] Request details:', {
+        url: whisperUrl,
+        method: 'POST',
+        filename: filename,
+        mimeType: mimeType,
+        audioSize: audioBuffer.length,
+        blobSize: audioBlob.size,
+        language: 'en',
+        responseFormat: 'text'
+      });
+
+      // Make direct HTTP request to Azure OpenAI Whisper API
+      // Use native fetch (Node.js 18+) which has better FormData support
+      // Note: FormData will set Content-Type with boundary automatically
+      const response = await fetch(whisperUrl, {
+        method: 'POST',
+        headers: {
+          'api-key': azureApiKey,
+          // Don't set Content-Type - FormData will set it with boundary automatically
+        },
+        body: formData,
+      });
+
+      console.log('[transcribe] Response status:', response.status, response.statusText);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorData: any;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { error: errorText };
+        }
+        
+        console.error('[transcribe] Azure OpenAI API error:', {
+          status: response.status,
+          statusText: response.statusText,
+          error: errorData
+        });
+
+        return res.status(response.status).json({
+          error: errorData.error?.message || errorData.error || `Azure OpenAI API error: ${response.status} ${response.statusText}`,
+          details: errorData,
+          status: response.status
+        });
+      }
+
+      // Get transcription text (response_format=text returns plain text)
+      const transcriptText = await response.text();
+      
+      if (!transcriptText || transcriptText.trim().length === 0) {
+        console.warn('[transcribe] Empty transcription received');
+        return res.status(500).json({ error: 'Received empty transcription from Azure OpenAI' });
+      }
+
+      console.log('[transcribe] Transcription successful:', transcriptText.trim());
+
+      res.json({ 
+        transcript: transcriptText.trim(),
+        language: 'en'
+      });
+    } catch (error: any) {
+      console.error('[transcribe] Transcription error:', error);
+      console.error('[transcribe] Error stack:', error.stack);
+      
+      // Provide more detailed error information
+      let errorMessage = error.message || 'Failed to transcribe audio';
+      let errorDetails: any = error.message;
+      
+      if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+        errorMessage = 'Failed to connect to Azure OpenAI endpoint. Please check your endpoint URL.';
+        errorDetails = error.message;
+      } else if (error.response) {
+        errorDetails = error.response.data || error.response.statusText;
+      }
+
+      res.status(500).json({ 
+        error: errorMessage,
+        details: errorDetails,
+        code: error.code
+      });
+    }
+  });
 
   const httpServer = createServer(app);
 

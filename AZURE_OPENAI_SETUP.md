@@ -11,6 +11,13 @@ AZURE_OPENAI_ENDPOINT=https://ai-29tiffanyg7516ai360826977620.openai.azure.com/
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 AZURE_OPENAI_DEPLOYMENT=your-deployment-name
 
+# Azure OpenAI Whisper (for voice transcription)
+# Optional: If you have a separate Whisper deployment, specify it here
+# Otherwise, it will use AZURE_OPENAI_DEPLOYMENT or default to 'whisper'
+AZURE_OPENAI_WHISPER_DEPLOYMENT=whisper
+# Optional: Whisper API version (defaults to 2024-06-01 if not set)
+AZURE_OPENAI_WHISPER_API_VERSION=2024-06-01
+
 # Google Maps API Key (keep this as is)
 GOOGLE_MAPS_API_KEY=your_google_maps_key
 VITE_GOOGLE_MAPS_API_KEY=your_google_maps_key
@@ -43,6 +50,25 @@ VITE_GOOGLE_MAPS_API_KEY=your_google_maps_key
   4. Copy the **Deployment name** (not the model name)
 - Example deployment names: `gpt-5-chat-deployment`, `my-gpt5-chat`, `production-gpt5`
 
+### 5. **AZURE_OPENAI_WHISPER_DEPLOYMENT** (Optional - for Voice Transcription)
+- This is your Whisper deployment name for voice transcription
+- **If not set**, it will use `AZURE_OPENAI_DEPLOYMENT` or default to `'whisper'`
+- Based on your target URI, your deployment name is: `whisper`
+- To set up Whisper in Azure:
+  1. Go to Azure Portal > Azure OpenAI resource
+  2. Go to "Model deployments" or "Deployments"
+  3. Click "Create deployment" or "Manage deployments"
+  4. Select a Whisper model (e.g., `whisper-1`)
+  5. Give it a deployment name (e.g., `whisper`, `whisper-deployment`, `voice-transcription`)
+  6. Copy that deployment name to `AZURE_OPENAI_WHISPER_DEPLOYMENT`
+- Example: `AZURE_OPENAI_WHISPER_DEPLOYMENT=whisper`
+
+### 6. **AZURE_OPENAI_WHISPER_API_VERSION** (Optional - for Voice Transcription)
+- Whisper API may use a different API version than the chat API
+- **If not set**, it will use `AZURE_OPENAI_API_VERSION` or default to `'2024-06-01'`
+- Based on your target URI, your Whisper API version is: `2024-06-01`
+- Example: `AZURE_OPENAI_WHISPER_API_VERSION=2024-06-01`
+
 ## How to Get Your Deployment Name
 
 ### Option 1: Azure Portal
@@ -65,6 +91,11 @@ AZURE_OPENAI_API_KEY=abc123def456ghi789jkl012mno345pq
 AZURE_OPENAI_ENDPOINT=https://ai-29tiffanyg7516ai360826977620.openai.azure.com/
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 AZURE_OPENAI_DEPLOYMENT=gpt-5-chat-prod
+
+# Azure OpenAI Whisper (for voice transcription)
+# Based on your target URI: https://ai-29tiffanyg7516ai360826977620.openai.azure.com/openai/deployments/whisper/audio/translations?api-version=2024-06-01
+AZURE_OPENAI_WHISPER_DEPLOYMENT=whisper
+AZURE_OPENAI_WHISPER_API_VERSION=2024-06-01
 
 # Google Maps
 GOOGLE_MAPS_API_KEY=AIzaSyD0Ch...your_key_here

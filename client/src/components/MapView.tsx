@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 interface MapViewProps {
   route?: any;
   stops?: Array<{
-    type: 'gas' | 'restaurant' | 'scenic';
+    type: 'gas' | 'restaurant' | 'scenic' | 'grocery' | 'coffee' | 'tea' | 'dessert' | 'bubbleTea';
     name: string;
     location?: any;
   }>;

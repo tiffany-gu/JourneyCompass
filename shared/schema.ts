@@ -31,6 +31,7 @@ export const tripRequests = pgTable("trip_requests", {
       tea?: boolean;
       dessert?: boolean;
       bubbleTea?: boolean;
+      grocery?: boolean;
     };
     customStops?: Array<{
       id: string;
@@ -38,7 +39,13 @@ export const tripRequests = pgTable("trip_requests", {
       keywords: string[];
       placeTypes: string[];
       minRating?: number;
+      maxDetourMinutes?: number;
     }>;
+    timeConstraints?: {
+      arrivalTime?: string; // e.g., "5:00 PM"
+      arrivalTimeHours?: number; // e.g., 2 (arrive in 2 hours)
+      departureTime?: string; // e.g., "2:00 PM"
+    };
   }>(),
   route: jsonb("route").$type<any>(),
   stops: jsonb("stops").$type<any[]>(),
