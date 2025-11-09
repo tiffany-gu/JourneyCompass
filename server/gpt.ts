@@ -559,13 +559,22 @@ Additional optional parameters to extract:
   - "along the way" / "on the way" / "on route" / "en route" / "on the path" → means stop should be along the main route, not off route
   - Store these as maxDetourMinutes in customStops: "nearby" = 5 minutes, "along the way" = default
 
-- Timing Constraints (Extract arrival time preferences):
-  - "arrive in 2 hours" / "get there in 2 hours" / "reach in about 2 hours" → {"preferences": {"timeConstraints": {"arrivalTimeHours": 2}}}
-  - "arrive by 3pm" / "get there by 5:00" / "get home by 5pm" / "home by 5:00 PM" → {"preferences": {"timeConstraints": {"arrivalTime": "3:00 PM"}}} (extract specific time)
-  - "leave at 2pm" / "depart at 2:00 PM" → {"preferences": {"timeConstraints": {"departureTime": "2:00 PM"}}}
+- Timing Constraints (CRITICAL - Extract all time-related requirements):
+  Types of time constraints:
+  1. Duration: "in 2 hours" / "in 90 minutes" → {"preferences": {"timeConstraints": {"durationMinutes": 120}}}
+  2. Deadline: "by 5pm" / "by 17:30" / "before 6pm" → {"preferences": {"timeConstraints": {"arrivalTime": "5:00 PM"}}}
+  3. Arrival Time: "arrive at home by 5pm" / "get there by 3:30pm" → {"preferences": {"timeConstraints": {"arrivalTime": "5:00 PM"}}}
+  4. Duration Hours (legacy): "arrive in 2 hours" → {"preferences": {"timeConstraints": {"arrivalTimeHours": 2}}}
+  5. Departure Time: "leave at 2pm" / "depart at 2:00 PM" → {"preferences": {"timeConstraints": {"departureTime": "2:00 PM"}}}
+
+  IMPORTANT:
+  - Extract BOTH the time constraint AND the tasks/stops in the same request
+  - "pick up kids and groceries in 2 hours" → extract "pick up kids" task, "groceries" task, AND "in 2 hours" duration
+  - "arrive home by 5pm, stop at supermarket" → extract "home" destination, "supermarket" stop, AND "by 5pm" deadline
+  - Time format: "HH:MM AM/PM" (e.g., "5:00 PM", "3:30 AM")
+  - For duration in minutes: convert "2 hours" → 120, "45 minutes" → 45, "1.5 hours" → 90
+  - When user says "get home by X", extract as arrivalTime constraint
   - "quick trip" / "fast" / "fastest route" → {"preferences": {"fast": true}}
-  - When user says "get home by X" or "arrive by X", extract the time and set it as arrivalTime in timeConstraints
-  - Time format should be "HH:MM AM/PM" (e.g., "5:00 PM", "3:30 AM")
 
 - Restaurant Preferences (Extract specific requirements from user's description):
   - "mediterranean food" / "mediterranean restaurant" / "good mediterranean food" → preferences: {"restaurantPreferences": {"cuisine": "mediterranean"}}
@@ -722,6 +731,64 @@ Output: {
   }
 }
 
+Input: "Hey Journey, Plan a route that helps me pick up the kids and pick up groceries for the house in 2 hrs"
+Output: {
+  "destination": "home",
+  "action": "useCurrentLocation",
+  "preferences": {
+    "timeConstraints": {
+      "durationMinutes": 120
+    },
+    "customStops": [
+      {
+        "id": "school",
+        "label": "Pick up kids",
+        "keywords": ["school", "pick up kids", "elementary school", "daycare"],
+        "placeTypes": ["school", "primary_school", "secondary_school"],
+        "estimatedDuration": 5,
+        "priority": "high"
+      },
+      {
+        "id": "grocery",
+        "label": "Grocery Store",
+        "keywords": ["grocery", "supermarket", "grocery store", "market", "food store"],
+        "placeTypes": ["supermarket", "grocery_store", "food", "store"],
+        "estimatedDuration": 20,
+        "minRating": 3.5
+      }
+    ]
+  }
+}
+
+Input: "I need to arrive at home by 5pm. can you route me to the supermarket and a chinese restaurant along the way"
+Output: {
+  "destination": "home",
+  "action": "useCurrentLocation",
+  "preferences": {
+    "timeConstraints": {
+      "arrivalTime": "5:00 PM"
+    },
+    "customStops": [
+      {
+        "id": "grocery",
+        "label": "Supermarket",
+        "keywords": ["grocery", "supermarket", "grocery store", "market"],
+        "placeTypes": ["supermarket", "grocery_store"],
+        "estimatedDuration": 15,
+        "minRating": 3.5
+      },
+      {
+        "id": "chinese",
+        "label": "Chinese Restaurant",
+        "keywords": ["chinese", "chinese restaurant", "chinese food"],
+        "placeTypes": ["chinese_restaurant", "restaurant"],
+        "estimatedDuration": 15,
+        "minRating": 4.0
+      }
+    ]
+  }
+}
+
 IMPORTANT:
 1. Always include city and state for locations to ensure Google Maps can find them
 2. Extract vehicle range information if mentioned (e.g., "150 miles of range", "RAV4 has ~400 mile range")
@@ -786,9 +853,12 @@ IMPORTANT:
     let destination = cleanedMessage.substring(toIndex + 4).trim();
     // Remove trailing punctuation but keep the full destination name
     destination = destination.replace(/[.!?,;:].*$/i, '').trim();
+    // Remove time constraints from destination (e.g., "Emery by 1:00 a.m." → "Emery")
+    destination = destination.replace(/\s+by\s+\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?|am|pm)?.*$/i, '').trim();
+    destination = destination.replace(/\s+in\s+\d+\s*(hours?|minutes?|mins?).*$/i, '').trim();
     // Remove common trailing words
-    destination = destination.replace(/\s+(please|thanks|thank you|now|today).*$/i, '').trim();
-    
+    destination = destination.replace(/\s+(please|thanks|thank you|now|today|and).*$/i, '').trim();
+
     // Validate: must be longer than 2 chars and not just "the", "a", "an"
     if (destination.length > 2 && destination.toLowerCase() !== 'the' && destination.toLowerCase() !== 'a' && destination.toLowerCase() !== 'an') {
       console.log('[parseUserRequest] Regex fallback extracted (to only):', { destination });

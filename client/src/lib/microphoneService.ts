@@ -10,10 +10,10 @@ export interface MicrophoneState {
 }
 
 // Timeouts based on industry standards (Google Cloud Speech-to-Text, Alexa)
-const SPEECH_END_TIMEOUT = 1200; // 1.2s after speech stops (natural pause detection)
+const SPEECH_END_TIMEOUT = 2000; // 2s after speech stops (allow for longer pauses mid-sentence)
 const MAX_RECORDING_TIME = 30000; // 30s maximum recording duration
 const INITIAL_SPEECH_TIMEOUT = 8000; // 8s timeout if user never speaks after wake word
-const SILENCE_THRESHOLD = -20; // -20 dB threshold for silence detection
+const SILENCE_THRESHOLD = -25; // -25 dB threshold for silence detection (more sensitive)
 const WAKE_WORD = 'hey journey'; // Wake word to activate recording
 
 /**

@@ -6,6 +6,7 @@ import { getDirections, findPlacesAlongRoute, calculateGasStops, reverseGeocode,
 import { findRouteConciergeStops } from "./concierge";
 import { insertTripRequestSchema, insertConversationMessageSchema } from "@shared/schema";
 import { calculateArrivalDeadline, calculateTimeAllocations, formatDuration } from "./timeUtils";
+import { parseTimeConstrainedRequest, formatTimeConstraint } from "./timeConstraintParser";
 import OpenAI, { AzureOpenAI } from "openai";
 
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -1658,6 +1659,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
         error: errorMessage,
         details: errorDetails,
         code: error.code
+      });
+    }
+  });
+
+  // Test endpoint for time constraint parser
+  app.post("/api/test-time-parser", async (req: Request, res: Response) => {
+    try {
+      const { message } = req.body;
+
+      if (!message) {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      console.log('[test-time-parser] Parsing message:', message);
+
+      const result = parseTimeConstrainedRequest(message);
+
+      // Format the time constraint for display
+      let formattedTimeConstraint = null;
+      if (result.timeConstraint) {
+        formattedTimeConstraint = {
+          ...result.timeConstraint,
+          formatted: formatTimeConstraint(result.timeConstraint)
+        };
+      }
+
+      return res.json({
+        success: true,
+        result: {
+          ...result,
+          timeConstraint: formattedTimeConstraint
+        }
+      });
+    } catch (error: any) {
+      console.error('[test-time-parser] Error:', error);
+      return res.status(500).json({
+        error: 'Failed to parse message',
+        details: error.message
       });
     }
   });
