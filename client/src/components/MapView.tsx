@@ -262,11 +262,11 @@ export default function MapView({ route, stops = [], addedStops = [], isNavigati
     });
     markersRef.current = userLocationMarkerRef.current ? [userLocationMarkerRef.current] : [];
 
-    if (addedStops.length === 0 || !route?.legs?.[0]) return;
+    if (!route?.legs?.[0]) return;
 
     const map = mapRef.current;
 
-    // Add start marker
+    // Add start marker (green dot)
     const startLoc = route.legs[0].start_location;
     const startMarker = new google.maps.Marker({
       position: { lat: startLoc.lat, lng: startLoc.lng },
@@ -280,7 +280,7 @@ export default function MapView({ route, stops = [], addedStops = [], isNavigati
     });
     markersRef.current.push(startMarker);
 
-    // Add destination marker
+    // Add destination marker (red dot)
     const endLoc = route.legs[route.legs.length - 1].end_location;
     const endMarker = new google.maps.Marker({
       position: { lat: endLoc.lat, lng: endLoc.lng },
@@ -293,6 +293,9 @@ export default function MapView({ route, stops = [], addedStops = [], isNavigati
       zIndex: 50,
     });
     markersRef.current.push(endMarker);
+
+    // Only add stop markers if there are stops
+    if (addedStops.length === 0) return;
 
     // Category-specific icon URLs
     const getCategoryIcon = (category: string | undefined, type: string): string => {

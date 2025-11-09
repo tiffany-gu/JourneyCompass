@@ -25,6 +25,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
   const wakeWordRecognitionRef = useRef<any>(null);
   const recordingStateRef = useRef<MicrophoneState | null>(null);
   const isListeningRef = useRef(false);
+  const isTransitioningRef = useRef(false); // Prevent concurrent state transitions
 
   // Keep ref in sync with state
   useEffect(() => {
@@ -35,10 +36,9 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
    * Handle when recording is complete and we have a transcript
    */
   const handleTranscript = useCallback((text: string) => {
-    console.log('[useMicrophone] Transcript received:', text);
     setTranscription(text);
     setIsRecording(false);
-    
+
     if (onTranscript) {
       onTranscript(text);
     }
@@ -48,7 +48,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
     if (enableWakeWord && isListeningRef.current) {
       setTimeout(() => {
         if (isListeningRef.current && !wakeWordRecognitionRef.current) {
-          console.log('[useMicrophone] Restarting wake word detection...');
+          console.log('🔄 [useMicrophone] Restarting wake word detection...');
           wakeWordRecognitionRef.current = startWakeWordDetection(
             handleWakeWordDetected,
             () => isListeningRef.current
@@ -62,7 +62,6 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
    * Handle stopping the current recording
    */
   const handleStopRecording = useCallback(() => {
-    console.log('[useMicrophone] Stopping recording...');
     if (recordingStateRef.current) {
       stopRecording(recordingStateRef.current);
       recordingStateRef.current = null;
@@ -74,57 +73,72 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
    * Handle when wake word is detected
    */
   const handleWakeWordDetected = useCallback(async () => {
-    console.log('[useMicrophone] Wake word detected! Starting recording...');
+    // CRITICAL: Prevent concurrent transitions
+    if (isTransitioningRef.current) {
+      console.log('[useMicrophone] ⚠️ Ignoring wake word - already transitioning');
+      return;
+    }
+
+    isTransitioningRef.current = true;
+    console.log('[useMicrophone] 🎤 Wake word detected! Starting recording...');
+
+    // CRITICAL: Stop wake word recognition FIRST to prevent conflicts
+    if (wakeWordRecognitionRef.current) {
+      try {
+        wakeWordRecognitionRef.current.stop();
+        wakeWordRecognitionRef.current = null;
+      } catch (e) {
+        console.error('❌ [useMicrophone] Error stopping wake word:', e);
+      }
+    }
+
+    // Wait a moment for the previous recognition to fully stop
+    await new Promise(resolve => setTimeout(resolve, 300));
+
     setIsRecording(true);
-    
+
     const state = await startRecordingWithSilenceDetection(
       handleTranscript,
       handleStopRecording
     );
-    
+
     if (state) {
       recordingStateRef.current = state;
     } else {
+      console.error('❌ [useMicrophone] Failed to start recording');
       setError('Failed to start recording');
       setIsRecording(false);
     }
+
+    isTransitioningRef.current = false;
   }, [handleTranscript, handleStopRecording]);
 
   /**
    * Start listening (wake word detection or direct recording)
    */
   const startListening = useCallback(async (isAutoStart = false) => {
-    console.log('[useMicrophone] startListening called - enableWakeWord:', enableWakeWord, 'isAutoStart:', isAutoStart);
-
     if (!checkBrowserCompatibility()) {
       const errorMsg = 'Your browser does not support speech recognition. Please use Chrome or Edge.';
-      console.error('[useMicrophone] Browser compatibility check failed');
       setError(errorMsg);
       if (!isAutoStart) {
         alert(errorMsg);
       }
       return false;
     }
-    console.log('[useMicrophone] Browser compatibility check passed');
 
     const hasPermission = await requestMicrophonePermission();
     if (!hasPermission) {
       const errorMsg = 'Could not access microphone. Please check permissions.';
-      console.error('[useMicrophone] Microphone permission denied');
       setError(errorMsg);
       if (!isAutoStart) {
         alert(errorMsg);
       }
       return false;
     }
-    console.log('[useMicrophone] Microphone permission granted');
 
     setError(null);
 
     if (enableWakeWord) {
-      // Start wake word detection
-      console.log('[useMicrophone] Starting wake word detection mode...');
-
       // CRITICAL FIX: Update ref BEFORE starting wake word detection
       isListeningRef.current = true;
       setIsListening(true);
@@ -133,10 +147,8 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
         handleWakeWordDetected,
         () => isListeningRef.current
       );
-      console.log('[useMicrophone] Wake word detection started - listening for "Hey Journey"');
     } else {
       // Start recording directly
-      console.log('[useMicrophone] Starting direct recording mode...');
       setIsRecording(true);
       const state = await startRecordingWithSilenceDetection(
         handleTranscript,
@@ -145,9 +157,8 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
 
       if (state) {
         recordingStateRef.current = state;
-        console.log('[useMicrophone] Direct recording started');
       } else {
-        console.error('[useMicrophone] Failed to start recording');
+        console.error('❌ [useMicrophone] Failed to start recording');
         setError('Failed to start recording');
         setIsRecording(false);
         return false;
@@ -161,8 +172,6 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
    * Stop listening (wake word detection or recording)
    */
   const stopListening = useCallback(() => {
-    console.log('[useMicrophone] Stopping listening...');
-
     // CRITICAL FIX: Update ref BEFORE stopping to prevent race conditions
     isListeningRef.current = false;
 
@@ -171,7 +180,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
       try {
         wakeWordRecognitionRef.current.stop();
       } catch (e) {
-        console.error('[useMicrophone] Error stopping wake word detection:', e);
+        // Silently handle
       }
       wakeWordRecognitionRef.current = null;
     }
@@ -182,18 +191,16 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
     setIsListening(false);
     setIsRecording(false);
     setError(null);
+    console.log('⏹️ [useMicrophone] Stopped');
   }, [handleStopRecording]);
 
   /**
    * Toggle listening on/off
    */
   const toggleListening = useCallback(async () => {
-    console.log('[useMicrophone] toggleListening called - isListening:', isListening, 'isRecording:', isRecording);
     if (isListening || isRecording) {
-      console.log('[useMicrophone] Stopping listening...');
       stopListening();
     } else {
-      console.log('[useMicrophone] Starting listening...');
       await startListening(false);
     }
   }, [isListening, isRecording, stopListening, startListening]);
@@ -217,24 +224,18 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
   // Auto-start on mount if requested (may fail due to browser requiring user gesture)
   useEffect(() => {
     if (autoStart) {
-      console.log('[useMicrophone] Auto-starting...');
-      const tryAutoStart = async () => {
-        const result = await startListening(true);
-        console.log('[useMicrophone] Auto-start result:', result);
-      };
-      tryAutoStart();
+      startListening(true);
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      console.log('[useMicrophone] Cleaning up on unmount...');
       if (wakeWordRecognitionRef.current) {
         try {
           wakeWordRecognitionRef.current.stop();
         } catch (e) {
-          console.error('[useMicrophone] Error stopping wake word on unmount:', e);
+          // Silently handle
         }
       }
       if (recordingStateRef.current) {

@@ -6,9 +6,13 @@ export interface MicrophoneState {
   javascriptNode: ScriptProcessorNode | null;
   currentStream: MediaStream | null;
   recognition: any; // SpeechRecognition type
+  silenceCheckInterval: NodeJS.Timeout | null;
 }
 
-const SILENCE_DURATION = 3500; // 3.5 seconds of silence before auto-stopping
+// Timeouts based on industry standards (Google Cloud Speech-to-Text, Alexa)
+const SPEECH_END_TIMEOUT = 1200; // 1.2s after speech stops (natural pause detection)
+const MAX_RECORDING_TIME = 30000; // 30s maximum recording duration
+const INITIAL_SPEECH_TIMEOUT = 8000; // 8s timeout if user never speaks after wake word
 const SILENCE_THRESHOLD = -20; // -20 dB threshold for silence detection
 const WAKE_WORD = 'hey journey'; // Wake word to activate recording
 
@@ -43,31 +47,32 @@ export function startWakeWordDetection(
 
   const recognition = new SpeechRecognition();
   recognition.continuous = true; // Keep listening
-  recognition.interimResults = true; // Get interim results for faster detection
+  recognition.interimResults = false; // Use final results only to prevent duplicate detections
   recognition.lang = 'en-US';
 
   // Track recognition state to prevent race conditions
   let isStarting = false;
   let isStopping = false;
+  let lastDetectionTime = 0;
+  const DETECTION_COOLDOWN = 2000; // 2 second cooldown between detections
 
   const safeStart = () => {
     if (isStarting || isStopping || !isListeningRef()) {
-      console.log('[Wake Word Detection] Skipping start - isStarting:', isStarting, 'isStopping:', isStopping, 'isListening:', isListeningRef());
       return;
     }
 
     isStarting = true;
     try {
       recognition.start();
-      console.log('🎤 [Wake Word Detection] ✅ Started listening for "Hey Journey"');
-      console.log('💡 [Wake Word Detection] Speak clearly: "Hey Journey"');
+      console.log('🎤 [Wake Word Detection] ✅ Listening for "Hey Journey"...');
       isStarting = false;
     } catch (e: any) {
-      console.error('[Wake Word Detection] Failed to start:', e.message);
       isStarting = false;
       // If already started, that's okay - we're already listening
       if (e.message.includes('already started')) {
-        console.log('[Wake Word Detection] Already running, continuing...');
+        console.log('🎤 [Wake Word Detection] Already active');
+      } else {
+        console.error('❌ [Wake Word Detection] Failed to start:', e.message);
       }
     }
   };
@@ -79,8 +84,6 @@ export function startWakeWordDetection(
       .toLowerCase()
       .trim();
 
-    console.log('[Wake Word Detection] Heard:', transcript);
-
     // Only match exact wake word or very close variations
     const variations = [
       'hey journey',
@@ -91,13 +94,24 @@ export function startWakeWordDetection(
     const matchedVariation = variations.find(v => transcript.includes(v));
 
     if (isListeningRef() && matchedVariation) {
-      console.log('[Wake Word Detection] Wake word detected!');
+      // Debounce: Check if enough time has passed since last detection
+      const now = Date.now();
+      if (now - lastDetectionTime < DETECTION_COOLDOWN) {
+        console.log('⏳ [Wake Word Detection] Cooldown active, ignoring duplicate');
+        return;
+      }
+
+      lastDetectionTime = now;
+      console.log('✅ [Wake Word Detection] "Hey Journey" detected!');
       isStopping = true;
+
       try {
         recognition.stop();
       } catch (e) {
-        console.error('[Wake Word Detection] Error stopping:', e);
+        console.error('❌ [Wake Word Detection] Error stopping:', e);
       }
+
+      // Wait for recognition to fully stop before triggering callback
       setTimeout(() => {
         isStopping = false;
         onWakeWordDetected();
@@ -106,24 +120,26 @@ export function startWakeWordDetection(
   };
 
   recognition.onerror = (event: any) => {
-    console.error('[Wake Word Detection] Error:', event.error);
-
     // Handle different error types
     if (event.error === 'no-speech') {
-      // Expected when no speech detected - just restart
-      console.log('[Wake Word Detection] No speech detected, will restart on end event');
+      // Expected when no speech detected - just restart on end event
+      return;
     } else if (event.error === 'audio-capture') {
       // Microphone access issue - wait longer before retry
-      console.error('[Wake Word Detection] Audio capture failed - microphone may be in use');
+      console.error('⚠️ [Wake Word Detection] Microphone busy, retrying...');
       setTimeout(() => {
         if (isListeningRef() && !isStarting && !isStopping) {
           safeStart();
         }
       }, 1000);
     } else if (event.error === 'not-allowed') {
-      console.error('[Wake Word Detection] Permission denied - stopping');
+      console.error('❌ [Wake Word Detection] Permission denied');
       isStopping = true;
+    } else if (event.error === 'aborted') {
+      // Expected when we manually stop - don't log as error
+      return;
     } else {
+      console.error('⚠️ [Wake Word Detection] Error:', event.error);
       // Other errors - retry after delay
       setTimeout(() => {
         if (isListeningRef() && !isStarting && !isStopping) {
@@ -134,14 +150,11 @@ export function startWakeWordDetection(
   };
 
   recognition.onend = () => {
-    console.log('[Wake Word Detection] Ended');
     if (isListeningRef() && !isStopping) {
       // Wait a bit before restarting to avoid race conditions
       setTimeout(() => {
         safeStart();
       }, 100);
-    } else {
-      console.log('[Wake Word Detection] Not restarting - isListening:', isListeningRef(), 'isStopping:', isStopping);
     }
   };
 
@@ -172,64 +185,123 @@ export async function startRecordingWithSilenceDetection(
     recognition.lang = 'en-US';
 
     let silenceTimer: NodeJS.Timeout | null = null;
+    let maxRecordingTimer: NodeJS.Timeout | null = null;
+    let initialSpeechTimer: NodeJS.Timeout | null = null;
     let hasSpoken = false;
+    let lastSpeechTime = Date.now();
 
     // Set up audio context for silence detection
     const audioContext = new AudioContext();
     const analyser = audioContext.createAnalyser();
     const microphone = audioContext.createMediaStreamSource(stream);
+
+    // Note: ScriptProcessorNode is deprecated but AudioWorkletNode requires
+    // a separate processor file. For now, we suppress the warning.
+    // TODO: Migrate to AudioWorkletNode in future
     const javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
 
     analyser.smoothingTimeConstant = 0.8;
     analyser.fftSize = 2048;
 
     microphone.connect(analyser);
-    analyser.connect(javascriptNode);
-    javascriptNode.connect(audioContext.destination);
+    // Don't connect to destination to avoid feedback/echo
 
-    // Monitor audio levels for silence detection
-    javascriptNode.onaudioprocess = () => {
+    // Use setInterval instead of onaudioprocess for better compatibility
+    let silenceCheckInterval: NodeJS.Timeout | null = null;
+
+    const stopRecordingWithCleanup = (reason: string) => {
+      console.log(`⏱️ [Recording] Auto-stopping (${reason})`);
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      if (initialSpeechTimer) clearTimeout(initialSpeechTimer);
+      if (silenceCheckInterval) clearInterval(silenceCheckInterval);
+      recognition.stop();
+      onStopRecording();
+    };
+
+    const checkAudioLevel = () => {
       const volume = getAudioLevel(analyser);
 
       if (volume > SILENCE_THRESHOLD) {
-        hasSpoken = true;
-        // Clear silence timer if speaking
+        // User is speaking
+        if (!hasSpoken) {
+          hasSpoken = true;
+          // Clear initial speech timeout since user started speaking
+          if (initialSpeechTimer) {
+            clearTimeout(initialSpeechTimer);
+            initialSpeechTimer = null;
+          }
+          console.log('🎙️ [Recording] Speech detected');
+        }
+
+        lastSpeechTime = Date.now();
+
+        // Clear silence timer while speaking
         if (silenceTimer) {
           clearTimeout(silenceTimer);
           silenceTimer = null;
         }
       } else if (hasSpoken) {
-        // Start silence timer only after user has spoken
+        // Silence detected after user has spoken
         if (!silenceTimer) {
-          console.log('[Recording] Silence detected, starting timer...');
+          // Start countdown for speech end
           silenceTimer = setTimeout(() => {
-            console.log('[Recording] Auto-stopping after silence');
-            recognition.stop();
-            onStopRecording();
-          }, SILENCE_DURATION);
+            stopRecordingWithCleanup('speech ended');
+          }, SPEECH_END_TIMEOUT);
         }
       }
     };
 
+    // Check audio level every 100ms
+    silenceCheckInterval = setInterval(checkAudioLevel, 100);
+
+    // Maximum recording time safety limit
+    maxRecordingTimer = setTimeout(() => {
+      stopRecordingWithCleanup('max duration reached');
+    }, MAX_RECORDING_TIME);
+
+    // Initial speech timeout - stop if user never speaks
+    initialSpeechTimer = setTimeout(() => {
+      if (!hasSpoken) {
+        stopRecordingWithCleanup('no speech detected');
+      }
+    }, INITIAL_SPEECH_TIMEOUT);
+
     recognition.onresult = (event: any) => {
       const transcript = event.results[event.results.length - 1][0].transcript;
-      console.log('[Recording] Transcript:', transcript);
+      console.log('✅ [Recording] Transcript:', transcript);
       onTranscript(transcript);
+
+      // Stop recording immediately after getting transcript
+      console.log('🛑 [Recording] Stopping...');
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      if (initialSpeechTimer) clearTimeout(initialSpeechTimer);
+      if (silenceCheckInterval) clearInterval(silenceCheckInterval);
+      recognition.stop();
+      onStopRecording();
     };
 
     recognition.onerror = (error: any) => {
-      console.error('[Recording] Speech recognition error:', error);
+      if (error.error !== 'aborted') {
+        console.error('❌ [Recording] Error:', error.error);
+      }
       if (silenceTimer) clearTimeout(silenceTimer);
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      if (initialSpeechTimer) clearTimeout(initialSpeechTimer);
+      if (silenceCheckInterval) clearInterval(silenceCheckInterval);
       onStopRecording();
     };
 
     recognition.onend = () => {
-      console.log('[Recording] Recognition ended');
       if (silenceTimer) clearTimeout(silenceTimer);
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      if (initialSpeechTimer) clearTimeout(initialSpeechTimer);
+      if (silenceCheckInterval) clearInterval(silenceCheckInterval);
     };
 
     recognition.start();
-    console.log('[Recording] Started recording with silence detection');
+    console.log('🔴 [Recording] Listening... (speak now)');
 
     return {
       audioContext,
@@ -237,7 +309,8 @@ export async function startRecordingWithSilenceDetection(
       microphone,
       javascriptNode,
       currentStream: stream,
-      recognition
+      recognition,
+      silenceCheckInterval
     };
   } catch (error) {
     console.error('[Recording] Error starting recording:', error);
@@ -249,14 +322,17 @@ export async function startRecordingWithSilenceDetection(
  * Stop recording and cleanup resources
  */
 export function stopRecording(state: MicrophoneState): void {
-  console.log('[Recording] Stopping and cleaning up...');
-
   if (state.recognition) {
     try {
       state.recognition.stop();
     } catch (e) {
-      console.error('[Recording] Error stopping recognition:', e);
+      // Silently handle - already stopped
     }
+  }
+
+  if (state.silenceCheckInterval) {
+    clearInterval(state.silenceCheckInterval);
+    state.silenceCheckInterval = null;
   }
 
   if (state.javascriptNode) {

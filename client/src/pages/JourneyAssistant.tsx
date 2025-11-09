@@ -118,6 +118,23 @@ export default function JourneyAssistant() {
         myLocationPattern.test(message) ||
         !fromPattern.test(message); // Always try to use current location if no "from" is specified
 
+      // Check if this is a NEW route request (contains routing keywords + from/to)
+      const routingKeywords = /\b(map|plan|route|trip|navigate|drive)\b/i;
+      const hasFromOrTo = fromPattern.test(message) || toPattern.test(message);
+      const isNewRouteRequest = routingKeywords.test(message) && hasFromOrTo;
+
+      // If it's a new route request, clear the tripRequestId so backend creates a new trip
+      let tripIdToSend = tripRequestId;
+      if (isNewRouteRequest && tripRequestId) {
+        console.log('[chatMutation] New route request detected, clearing trip ID and old data');
+        tripIdToSend = null;
+        // Preemptively clear old route data
+        setRouteData(null);
+        setStops([]);
+        setAddedStops([]);
+        setUserRequestedStops(false);
+      }
+
       let locationToSend = null;
       if (shouldUseCurrentLocation) {
         if (userLocation) {
@@ -153,7 +170,7 @@ export default function JourneyAssistant() {
         }
       }
 
-      const res = await apiRequest('POST', '/api/chat', { message, tripRequestId, userLocation: locationToSend });
+      const res = await apiRequest('POST', '/api/chat', { message, tripRequestId: tripIdToSend, userLocation: locationToSend });
       return await res.json();
     },
     onSuccess: (data: any) => {
@@ -166,9 +183,13 @@ export default function JourneyAssistant() {
       setMessages((prev) => [...prev, aiMessage]);
 
       if (data.tripRequestId) {
-        // If this is a new trip, reset the stops requested flag
+        // If this is a new trip, reset everything
         if (data.tripRequestId !== tripRequestId) {
+          console.log('[JourneyAssistant] New trip detected, clearing old route and stops');
           setUserRequestedStops(false);
+          setRouteData(null);  // Clear old route
+          setStops([]);        // Clear old stops
+          setAddedStops([]);   // Clear manually added stops
         }
         setTripRequestId(data.tripRequestId);
       }
@@ -597,6 +618,7 @@ export default function JourneyAssistant() {
               onSendMessage={handleSendMessage}
               onVoiceClick={handleVoiceClick}
               isRecording={isRecording}
+              isListening={isListening}
             />
           </div>
         </div>
