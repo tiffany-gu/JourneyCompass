@@ -13,7 +13,7 @@ export default function AppHeader({ isListening = false, isRecording = false }: 
         <div className="w-8 h-8 rounded-md bg-primary flex items-center justify-center">
           <Navigation className="w-5 h-5 text-primary-foreground" />
         </div>
-        <h1 className="text-lg font-semibold">Journey Assistant</h1>
+        <h1 className="text-lg font-semibold">Journey Compass</h1>
       </div>
       
       <div className="flex items-center gap-4">
